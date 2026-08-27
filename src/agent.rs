@@ -7,8 +7,6 @@ use crate::error::{Error, Result};
 use crate::llm::{LanguageModel, Message};
 use crate::tool::ToolRegistry;
 
-const MAX_IDENTICAL_CALLS: usize = 3;
-
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Thinking {
@@ -76,9 +74,14 @@ impl Agent {
         }
         self.messages.push(Message::user(task));
         let definitions = self.tools.definitions();
-        let mut repeated_calls = BTreeMap::<String, usize>::new();
+        let mut call_cache = BTreeMap::<String, (usize, String)>::new();
 
         for step in 1..=self.max_steps {
+            if step == self.max_steps.saturating_sub(1) {
+                self.messages.push(Message::system(
+                    "You are near the step limit. If the requested result has already been verified, do not call another tool; return the final concise summary now.",
+                ));
+            }
             self.emit(AgentEvent::Thinking { step });
             if let Some(event) = self
                 .context
@@ -106,13 +109,17 @@ impl Agent {
 
             for call in tool_calls {
                 let signature = format!("{}:{}", call.function.name, call.function.arguments);
-                let repeats = repeated_calls.entry(signature).or_default();
-                *repeats += 1;
-                if *repeats >= MAX_IDENTICAL_CALLS {
-                    return Err(Error::Agent(format!(
-                        "stopped after {MAX_IDENTICAL_CALLS} identical calls to '{}'",
-                        call.function.name
-                    )));
+                if let Some((repeat_count, previous_result)) = call_cache.get_mut(&signature) {
+                    *repeat_count += 1;
+                    let observation = format!(
+                        "Duplicate tool call skipped to avoid repeating side effects. The identical call already succeeded or failed with this result:\n\n{previous_result}\n\nUse that result and continue; do not call the same tool with the same arguments again."
+                    );
+                    self.emit(AgentEvent::ToolResult {
+                        name: call.function.name,
+                        result: format!("duplicate #{} skipped", *repeat_count),
+                    });
+                    self.messages.push(Message::tool(call.id, observation));
+                    continue;
                 }
 
                 self.emit(AgentEvent::ToolCall {
@@ -125,9 +132,10 @@ impl Agent {
                     .execute(&call.function.name, &call.function.arguments)
                     .await;
                 self.emit(AgentEvent::ToolResult {
-                    name: call.function.name,
+                    name: call.function.name.clone(),
                     result: observation.clone(),
                 });
+                call_cache.insert(signature, (0, observation.clone()));
                 self.messages.push(Message::tool(call.id, observation));
             }
         }
@@ -167,13 +175,18 @@ impl Agent {
 fn system_prompt(workspace: &Path) -> String {
     format!(
         "You are a careful coding agent working only inside this workspace: {}\n\
-         Inspect relevant files before editing. Prefer replace_text for small edits and write_file \
-         for new files. Run the project's tests or checks after changes when practical. Tool errors \
+         Every requested file must remain inside that workspace. If the user asks for a path outside it, explain that they must restart the agent with that path as --workspace; never bypass the file sandbox through shell commands. \
+         Inspect relevant files before editing. Always use write_file to create files and replace_text for small edits; never use run_command, shell redirection, or PowerShell file commands to create or edit files. Use run_command only to build, test, or run the resulting project, and do not repeat a command after it has already returned a successful result. Tool errors \
          are observations: correct the request instead of pretending it succeeded. Never request \
          secrets or bypass the sandbox and command policy. When the task is complete, respond with \
          a concise summary of changes and verification performed.",
-        workspace.display()
+        human_path(workspace)
     )
+}
+
+fn human_path(path: &Path) -> String {
+    let display = path.display().to_string();
+    display.strip_prefix(r"\\?\").unwrap_or(&display).to_owned()
 }
 
 fn one_line(value: &str) -> String {
@@ -189,6 +202,7 @@ fn one_line(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -241,14 +255,35 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn executes_tool_then_returns_text() {
-        let tool_call = Message {
+    struct CountingEchoTool(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Tool for CountingEchoTool {
+        fn name(&self) -> &'static str {
+            "echo"
+        }
+
+        fn description(&self) -> &'static str {
+            "echo a value"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn execute(&self, arguments: Value) -> Result<String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(arguments.to_string())
+        }
+    }
+
+    fn echo_call(id: &str) -> Message {
+        Message {
             role: Role::Assistant,
             content: None,
             reasoning_content: None,
             tool_calls: Some(vec![ToolCall {
-                id: "call-1".to_owned(),
+                id: id.to_owned(),
                 kind: "function".to_owned(),
                 function: FunctionCall {
                     name: "echo".to_owned(),
@@ -256,7 +291,12 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn executes_tool_then_returns_text() {
+        let tool_call = echo_call("call-1");
         let model = Arc::new(MockModel {
             responses: Mutex::new(VecDeque::from([tool_call, Message::assistant("done")])),
         });
@@ -274,5 +314,28 @@ mod tests {
                 .iter()
                 .any(|message| message.role == Role::Tool)
         );
+    }
+
+    #[tokio::test]
+    async fn identical_tool_call_is_executed_only_once() {
+        let model = Arc::new(MockModel {
+            responses: Mutex::new(VecDeque::from([
+                echo_call("call-1"),
+                echo_call("call-2"),
+                Message::assistant("done"),
+            ])),
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(CountingEchoTool(Arc::clone(&executions)))
+            .expect("register");
+        let workspace = tempdir().expect("workspace");
+        let mut agent = Agent::new(model, registry, workspace.path(), 5, 128_000);
+
+        let result = agent.run_turn("do it").await.expect("agent run");
+
+        assert_eq!(result, "done");
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
     }
 }

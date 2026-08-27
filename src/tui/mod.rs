@@ -450,7 +450,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
                 .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from(format!("Workspace  {}", app.workspace.display())),
+        Line::from(format!("Workspace  {}", display_path(&app.workspace))),
         Line::from("F1 帮助 · Ctrl+L 事件栏 · Ctrl+D 退出"),
     ])
     .block(Block::default().borders(Borders::ALL).title("Workspace"));
@@ -567,4 +567,9 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     } else if app.show_help {
         overlay::draw_help(frame);
     }
+}
+
+fn display_path(path: &std::path::Path) -> String {
+    let display = path.display().to_string();
+    display.strip_prefix(r"\\?\").unwrap_or(&display).to_owned()
 }

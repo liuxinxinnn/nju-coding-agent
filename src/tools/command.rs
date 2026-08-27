@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::io::{self, Write as _};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -41,6 +42,7 @@ pub struct RunCommand {
     sandbox: Sandbox,
     auto_approve: bool,
     approval: ApprovalFn,
+    approved_commands: Mutex<HashSet<String>>,
 }
 
 pub type ApprovalFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -51,6 +53,7 @@ impl RunCommand {
             sandbox,
             auto_approve,
             approval: Arc::new(|command| confirm(command).unwrap_or(false)),
+            approved_commands: Mutex::new(HashSet::new()),
         }
     }
 
@@ -59,6 +62,7 @@ impl RunCommand {
             sandbox,
             auto_approve,
             approval,
+            approved_commands: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -90,12 +94,28 @@ impl Tool for RunCommand {
             .get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Tool("missing command".to_owned()))?;
+        ensure_command_paths_inside_workspace(command, self.sandbox.root())?;
         match CommandPolicy::evaluate(command) {
             CommandDecision::Block => {
                 return Err(Error::Tool("command blocked by safety policy".to_owned()));
             }
-            CommandDecision::Confirm if !self.auto_approve && !(self.approval)(command) => {
-                return Err(Error::Tool("user denied command execution".to_owned()));
+            CommandDecision::Confirm if !self.auto_approve => {
+                let already_approved = self
+                    .approved_commands
+                    .lock()
+                    .map_err(|_| Error::Tool("command approval cache is unavailable".to_owned()))?
+                    .contains(command);
+                if !already_approved {
+                    if !(self.approval)(command) {
+                        return Err(Error::Tool("user denied command execution".to_owned()));
+                    }
+                    self.approved_commands
+                        .lock()
+                        .map_err(|_| {
+                            Error::Tool("command approval cache is unavailable".to_owned())
+                        })?
+                        .insert(command.to_owned());
+                }
             }
             CommandDecision::Allow | CommandDecision::Confirm => {}
         }
@@ -165,6 +185,90 @@ fn confirm(command: &str) -> Result<bool> {
     ))
 }
 
+fn ensure_command_paths_inside_workspace(command: &str, workspace: &std::path::Path) -> Result<()> {
+    let normalized_command = command.replace('\\', "/");
+    if normalized_command
+        .split(|character: char| character.is_whitespace() || "'\"`;|&()".contains(character))
+        .any(|token| {
+            token == ".."
+                || token.starts_with("../")
+                || token.ends_with("/..")
+                || token.contains("/../")
+        })
+    {
+        return Err(Error::Tool(
+            "command contains a parent-directory path outside the workspace policy".to_owned(),
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        let workspace = normalize_windows_path(&workspace.display().to_string());
+        for candidate in windows_absolute_paths(command) {
+            let candidate = normalize_windows_path(candidate);
+            let prefix = format!("{workspace}/");
+            if candidate != workspace && !candidate.starts_with(&prefix) {
+                return Err(Error::Tool(format!(
+                    "command path escapes workspace: {candidate}. Restart with that directory as --workspace instead"
+                )));
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        for token in command.split_whitespace() {
+            let candidate = token.trim_matches(['\'', '"', ';', '|', '&', '(', ')']);
+            if candidate.starts_with('/') && !std::path::Path::new(candidate).starts_with(workspace)
+            {
+                return Err(Error::Tool(format!(
+                    "command path escapes workspace: {candidate}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_absolute_paths(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        if bytes[index].is_ascii_alphabetic()
+            && bytes[index + 1] == b':'
+            && matches!(bytes[index + 2], b'\\' | b'/')
+        {
+            let start = index;
+            index += 3;
+            while index < bytes.len()
+                && !bytes[index].is_ascii_whitespace()
+                && !matches!(
+                    bytes[index],
+                    b'\'' | b'"' | b'`' | b';' | b'|' | b'&' | b'(' | b')' | b','
+                )
+            {
+                index += 1;
+            }
+            if let Some(path) = command.get(start..index) {
+                paths.push(path);
+            }
+            continue;
+        }
+        index += 1;
+    }
+    paths
+}
+
+#[cfg(windows)]
+fn normalize_windows_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_start_matches("//?/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
 fn is_read_only(command: &str) -> bool {
     if contains_shell_control(command) {
         return false;
@@ -223,14 +327,16 @@ fn is_blocked(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use serde_json::json;
     use tempfile::tempdir;
 
     use crate::tool::Tool;
 
-    use super::{CommandDecision, CommandPolicy, RunCommand, Sandbox};
+    use super::{
+        CommandDecision, CommandPolicy, RunCommand, Sandbox, ensure_command_paths_inside_workspace,
+    };
 
     #[test]
     fn blocks_destructive_commands() {
@@ -275,5 +381,51 @@ mod tests {
 
         assert!(called.load(Ordering::SeqCst));
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn approved_identical_command_is_not_confirmed_twice() {
+        let workspace = tempdir().expect("workspace");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let tool = RunCommand::with_approval(
+            Sandbox::new(workspace.path().to_path_buf()).expect("sandbox"),
+            false,
+            Arc::new(move |_command| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                true
+            }),
+        );
+
+        let first = tool.execute(json!({"command": "echo hello"})).await;
+        let second = tool.execute(json!({"command": "echo hello"})).await;
+
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rejects_parent_directory_paths_in_commands() {
+        let workspace = tempdir().expect("workspace");
+        let result =
+            ensure_command_paths_inside_workspace("python ../outside/hello.py", workspace.path());
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_absolute_windows_path_outside_workspace() {
+        let workspace = std::path::Path::new(r"D:\NJU-Agent\agent-sandbox");
+        let result =
+            ensure_command_paths_inside_workspace(r"python D:\NJU-Agent\test\hello.py", workspace);
+        assert!(result.is_err());
+        assert!(
+            ensure_command_paths_inside_workspace(
+                r"python D:\NJU-Agent\agent-sandbox\hello.py",
+                workspace,
+            )
+            .is_ok()
+        );
     }
 }

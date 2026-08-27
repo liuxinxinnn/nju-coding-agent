@@ -16,7 +16,7 @@ pub(super) fn draw_confirmation(frame: &mut Frame<'_>, prompt: &str) {
         Line::from(String::new()),
         Line::from(vec![
             Span::styled("Y", Style::default().fg(Color::LightGreen)),
-            Span::raw(" 允许    "),
+            Span::raw(" 允许（本会话相同命令不再询问）    "),
             Span::styled("N / Esc / Enter", Style::default().fg(Color::LightRed)),
             Span::raw(" 拒绝"),
         ]),
