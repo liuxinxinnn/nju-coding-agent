@@ -16,10 +16,32 @@ pub struct Config {
 
 impl Config {
     pub fn from_env(workspace: PathBuf, max_steps: usize, auto_approve: bool) -> Result<Self> {
-        let api_key = required_env("CODING_AGENT_API_KEY")?;
-        let model = required_env("CODING_AGENT_MODEL")?;
-        let base_url = env::var("CODING_AGENT_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_owned());
+        let generic_key = non_empty_env("CODING_AGENT_API_KEY");
+        let deepseek_key = non_empty_env("DEEPSEEK_API_KEY");
+        let using_deepseek_defaults = generic_key.is_none() && deepseek_key.is_some();
+        let api_key = generic_key.or(deepseek_key).ok_or_else(|| {
+            Error::Config(
+                "missing CODING_AGENT_API_KEY or DEEPSEEK_API_KEY environment variable".to_owned(),
+            )
+        })?;
+        let base_url = non_empty_env("CODING_AGENT_BASE_URL")
+            .or_else(|| non_empty_env("DEEPSEEK_BASE_URL"))
+            .unwrap_or_else(|| {
+                if using_deepseek_defaults {
+                    "https://api.deepseek.com".to_owned()
+                } else {
+                    "https://api.openai.com/v1".to_owned()
+                }
+            });
+        let model = non_empty_env("CODING_AGENT_MODEL")
+            .or_else(|| non_empty_env("DEEPSEEK_MODEL"))
+            .or_else(|| using_deepseek_defaults.then(|| "deepseek-v4-flash".to_owned()))
+            .ok_or_else(|| {
+                Error::Config(
+                    "missing CODING_AGENT_MODEL (DeepSeek defaults to deepseek-v4-flash)"
+                        .to_owned(),
+                )
+            })?;
         let context_window_tokens = env::var("CODING_AGENT_CONTEXT_WINDOW")
             .ok()
             .map(|value| {
@@ -30,7 +52,11 @@ impl Config {
                 })
             })
             .transpose()?
-            .unwrap_or(crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS)
+            .unwrap_or(if using_deepseek_defaults {
+                1_000_000
+            } else {
+                crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS
+            })
             .max(1);
         let workspace = workspace
             .canonicalize()
@@ -55,9 +81,6 @@ impl Config {
     }
 }
 
-fn required_env(name: &str) -> Result<String> {
-    env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| Error::Config(format!("missing environment variable {name}")))
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }

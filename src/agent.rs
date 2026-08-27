@@ -183,6 +183,7 @@ mod tests {
         let tool_call = Message {
             role: Role::Assistant,
             content: None,
+            reasoning_content: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call-1".to_owned(),
                 kind: "function".to_owned(),

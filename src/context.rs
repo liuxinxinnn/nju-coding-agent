@@ -167,6 +167,11 @@ fn estimate_message_tokens(message: &Message) -> u64 {
         .as_deref()
         .map(estimate_text_tokens)
         .unwrap_or(0);
+    let reasoning_tokens = message
+        .reasoning_content
+        .as_deref()
+        .map(estimate_text_tokens)
+        .unwrap_or(0);
     let call_tokens = message
         .tool_calls
         .as_ref()
@@ -186,6 +191,7 @@ fn estimate_message_tokens(message: &Message) -> u64 {
         .unwrap_or(0);
     MESSAGE_OVERHEAD_TOKENS
         .saturating_add(content_tokens)
+        .saturating_add(reasoning_tokens)
         .saturating_add(call_tokens)
         .saturating_add(call_id_tokens)
 }

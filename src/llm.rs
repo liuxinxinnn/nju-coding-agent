@@ -12,6 +12,8 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -34,6 +36,7 @@ impl Message {
         Self {
             role: Role::Tool,
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some(call_id.into()),
         }
@@ -43,6 +46,7 @@ impl Message {
         Self {
             role,
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -109,6 +113,7 @@ pub struct HttpLanguageModel {
     endpoint: String,
     api_key: String,
     model: String,
+    deepseek_thinking: bool,
 }
 
 impl HttpLanguageModel {
@@ -118,9 +123,11 @@ impl HttpLanguageModel {
             .build()
             .map_err(|error| Error::Llm(format!("failed to build HTTP client: {error}")))?;
 
+        let endpoint = chat_completions_endpoint(base_url);
         Ok(Self {
             client,
-            endpoint: chat_completions_endpoint(base_url),
+            deepseek_thinking: endpoint.contains("api.deepseek.com"),
+            endpoint,
             api_key,
             model,
         })
@@ -132,7 +139,16 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [Message],
     tools: &'a [ToolDefinition],
-    tool_choice: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct ThinkingConfig {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -166,7 +182,10 @@ impl LanguageModel for HttpLanguageModel {
                 model: &self.model,
                 messages,
                 tools,
-                tool_choice: "auto",
+                thinking: self
+                    .deepseek_thinking
+                    .then_some(ThinkingConfig { kind: "enabled" }),
+                reasoning_effort: self.deepseek_thinking.then_some("high"),
             })
             .send()
             .await

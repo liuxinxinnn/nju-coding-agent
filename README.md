@@ -11,13 +11,13 @@
 
 ## 运行
 
-设置环境变量：
+推荐使用 DeepSeek 官方 OpenAI-compatible API。只需设置密钥；默认模型为支持 tool calling 的 `deepseek-v4-flash`，默认上下文窗口为 1M：
 
 ```powershell
-$env:CODING_AGENT_API_KEY = "..."
-$env:CODING_AGENT_BASE_URL = "https://api.openai.com/v1"
-$env:CODING_AGENT_MODEL = "..."
+$env:DEEPSEEK_API_KEY = "新生成的密钥"
 ```
+
+可选覆盖项为 `DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL` 和 `CODING_AGENT_CONTEXT_WINDOW`。也继续支持通用的 `CODING_AGENT_API_KEY`、`CODING_AGENT_BASE_URL`、`CODING_AGENT_MODEL`。
 
 执行单个任务：
 
@@ -35,6 +35,7 @@ cargo run -- --workspace D:\path\to\project "修复测试失败并运行测试�
 - [x] 文件、搜索、编辑、命令工具
 - [x] 安全边界与自动化测试
 - [x] 从 SecAudit 适配上下文预算与本地压缩，保留最近完整用户轮次
+- [x] DeepSeek V4 默认配置及思考模式 `reasoning_content` 回传
 - [ ] 使用真实模型完成创建文件与修复 bug 的冒烟任务
 
 ## 已实现的终止与错误路径
