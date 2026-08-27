@@ -135,6 +135,9 @@ impl Agent {
                     name: call.function.name.clone(),
                     result: observation.clone(),
                 });
+                if invalidates_cached_observations(&call.function.name, &observation) {
+                    call_cache.clear();
+                }
                 call_cache.insert(signature, (0, observation.clone()));
                 self.messages.push(Message::tool(call.id, observation));
             }
@@ -170,6 +173,10 @@ impl Agent {
             ),
         }
     }
+}
+
+fn invalidates_cached_observations(tool_name: &str, observation: &str) -> bool {
+    matches!(tool_name, "write_file" | "replace_text") && !observation.starts_with("ERROR:")
 }
 
 fn system_prompt(workspace: &Path) -> String {
@@ -277,7 +284,32 @@ mod tests {
         }
     }
 
-    fn echo_call(id: &str) -> Message {
+    struct NamedCountingTool {
+        name: &'static str,
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for NamedCountingTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn description(&self) -> &'static str {
+            "count executions"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn execute(&self, _arguments: Value) -> Result<String> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok("ok".to_owned())
+        }
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: &str) -> Message {
         Message {
             role: Role::Assistant,
             content: None,
@@ -286,12 +318,16 @@ mod tests {
                 id: id.to_owned(),
                 kind: "function".to_owned(),
                 function: FunctionCall {
-                    name: "echo".to_owned(),
-                    arguments: r#"{"value":"ok"}"#.to_owned(),
+                    name: name.to_owned(),
+                    arguments: arguments.to_owned(),
                 },
             }]),
             tool_call_id: None,
         }
+    }
+
+    fn echo_call(id: &str) -> Message {
+        tool_call(id, "echo", r#"{"value":"ok"}"#)
     }
 
     #[tokio::test]
@@ -337,5 +373,45 @@ mod tests {
 
         assert_eq!(result, "done");
         assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn command_can_run_again_after_successful_file_edit() {
+        let command_arguments = r#"{"command":"python -m unittest"}"#;
+        let model = Arc::new(MockModel {
+            responses: Mutex::new(VecDeque::from([
+                tool_call("call-1", "run_command", command_arguments),
+                tool_call(
+                    "call-2",
+                    "replace_text",
+                    r#"{"path":"app.py","old_text":"bad","new_text":"good"}"#,
+                ),
+                tool_call("call-3", "run_command", command_arguments),
+                Message::assistant("done"),
+            ])),
+        });
+        let command_executions = Arc::new(AtomicUsize::new(0));
+        let edit_executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(NamedCountingTool {
+                name: "run_command",
+                executions: Arc::clone(&command_executions),
+            })
+            .expect("register command");
+        registry
+            .register(NamedCountingTool {
+                name: "replace_text",
+                executions: Arc::clone(&edit_executions),
+            })
+            .expect("register edit");
+        let workspace = tempdir().expect("workspace");
+        let mut agent = Agent::new(model, registry, workspace.path(), 6, 128_000);
+
+        let result = agent.run_turn("fix and verify").await.expect("agent run");
+
+        assert_eq!(result, "done");
+        assert_eq!(edit_executions.load(Ordering::SeqCst), 1);
+        assert_eq!(command_executions.load(Ordering::SeqCst), 2);
     }
 }

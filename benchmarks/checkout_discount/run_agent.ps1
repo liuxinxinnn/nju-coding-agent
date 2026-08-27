@@ -2,6 +2,10 @@
 param()
 
 $ErrorActionPreference = "Stop"
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
 $benchmarkRoot = $PSScriptRoot
 $repoRoot = (Resolve-Path (Join-Path $benchmarkRoot "..\..")).Path
 $workspace = Join-Path $benchmarkRoot "workspace"
