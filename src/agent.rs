@@ -152,20 +152,20 @@ impl Agent {
             return;
         }
         match event {
-            AgentEvent::Thinking { step } => eprintln!("[step {step}] thinking"),
+            AgentEvent::Thinking { step } => println!("[step {step}] thinking"),
             AgentEvent::ToolCall {
                 step,
                 name,
                 arguments,
-            } => eprintln!("[step {step}] {name} {arguments}"),
+            } => println!("[step {step}] {name} {arguments}"),
             AgentEvent::ToolResult { name, result } => {
-                eprintln!("[tool:{name}] {}", one_line(&result));
+                println!("[tool:{name}] {}", one_line(&result));
             }
             AgentEvent::ContextCompressed {
                 covered_messages,
                 before_tokens,
                 after_tokens,
-            } => eprintln!(
+            } => println!(
                 "[context] compressed {covered_messages} messages: {before_tokens} -> {after_tokens} estimated tokens"
             ),
         }

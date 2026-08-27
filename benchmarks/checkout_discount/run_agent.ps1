@@ -30,8 +30,15 @@ $agent = Join-Path $repoRoot "target\debug\nju-coding-agent.exe"
 $task = Get-Content -LiteralPath (Join-Path $workspace "TASK.md") -Raw -Encoding UTF8
 $timer = [System.Diagnostics.Stopwatch]::StartNew()
 
-& $agent --yes --workspace $workspace $task 2>&1 | Tee-Object -FilePath $logPath
-$agentExitCode = $LASTEXITCODE
+$previousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    & $agent --yes --workspace $workspace $task 2>&1 | Tee-Object -FilePath $logPath
+    $agentExitCode = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+}
 $timer.Stop()
 
 $trace = Get-Content -LiteralPath $logPath -ErrorAction SilentlyContinue
