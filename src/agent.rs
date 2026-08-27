@@ -195,6 +195,11 @@ impl Agent {
         self.messages.push(Message::user(task));
         let definitions = self.tools.definitions();
         let planning_definitions = planning_tool_definitions(&definitions);
+        let later_phase_tools = definitions
+            .iter()
+            .filter(|definition| !is_planning_tool(&definition.function.name))
+            .map(|definition| definition.function.name.as_str())
+            .collect::<Vec<_>>();
         let mut call_cache = BTreeMap::<String, (usize, String)>::new();
         self.emit(AgentEvent::ProjectDetected {
             kind: self.project.kind.label().to_owned(),
@@ -202,8 +207,10 @@ impl Agent {
             verification_command: self.project.verification_command.clone(),
         });
         self.transition_to(AgentPhase::Planning);
-        self.messages
-            .push(Message::system(planning_prompt(&self.project)));
+        self.messages.push(Message::system(planning_prompt(
+            &self.project,
+            &later_phase_tools,
+        )));
 
         for step in 1..=self.max_steps {
             if self.phase != AgentPhase::Planning && step == self.max_steps.saturating_sub(1) {
@@ -566,9 +573,17 @@ fn append_runtime_note(observation: &mut String, note: &str) {
     observation.push_str(note);
 }
 
-fn planning_prompt(project: &ProjectProfile) -> String {
+fn planning_prompt(project: &ProjectProfile, later_phase_tools: &[&str]) -> String {
+    let later_phase_note = if later_phase_tools.is_empty() {
+        "No additional tools are registered for later phases.".to_owned()
+    } else {
+        format!(
+            "After you return the plan, the runtime automatically enters EXECUTE/VERIFY and exposes these additional tools: {}. The current limited tool list is phase-scoped; do not claim those later tools are unavailable and do not try to launch another agent instance.",
+            later_phase_tools.join(", ")
+        )
+    };
     format!(
-        "PLAN phase. Understand the task before changing anything. You may inspect the workspace only with read_file, list_files, and search_text. Do not run commands or modify files. When you have enough evidence, return a concise numbered plan with the intended change and verification strategy, without tool calls. This response is a plan, not the final answer. {}",
+        "PLAN phase. Understand the task before changing anything. You may inspect the workspace only with read_file, list_files, and search_text. Do not run commands or modify files during PLAN. {later_phase_note} When you have enough evidence, return a concise numbered plan with the intended change and verification strategy, without tool calls. This response is a plan, not the final answer. {}",
         project.prompt_hint()
     )
 }
@@ -632,6 +647,7 @@ mod tests {
 
     use crate::error::{Error, Result};
     use crate::llm::{FunctionCall, LanguageModel, Message, Role, ToolCall, ToolDefinition};
+    use crate::project::ProjectProfile;
     use crate::tool::{Tool, ToolRegistry};
 
     use super::{Agent, AgentState};
@@ -1062,5 +1078,18 @@ mod tests {
 
         assert!(error.to_string().contains("invalid verified revision"));
         assert_eq!(agent.workspace_revision(), 0);
+    }
+
+    #[test]
+    fn planning_prompt_explains_that_mutating_tools_arrive_in_later_phases() {
+        let workspace = tempdir().expect("workspace");
+        let profile = ProjectProfile::detect(workspace.path());
+
+        let prompt =
+            super::planning_prompt(&profile, &["write_file", "replace_text", "run_command"]);
+
+        assert!(prompt.contains("automatically enters EXECUTE/VERIFY"));
+        assert!(prompt.contains("write_file, replace_text, run_command"));
+        assert!(prompt.contains("do not claim those later tools are unavailable"));
     }
 }
