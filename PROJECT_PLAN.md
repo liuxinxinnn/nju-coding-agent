@@ -49,7 +49,7 @@ CLI
 ### M3：特色功能
 
 - [已完成] Plan -> Execute -> Verify 状态机：PLAN 只读、修改递增 workspace revision、明确验证命令成功后才允许 DONE。
-- 根据项目类型选择 test/lint/build 验证命令，但执行仍经过命令策略。
+- [已完成] 根据项目类型选择 test/lint/build 验证命令，检测结果注入 PEV，执行仍经过命令策略。
 - 失败后把验证结果送回模型，允许有限次数修复。
 
 ### M4：提交材料

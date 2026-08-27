@@ -51,6 +51,7 @@ TUI 快捷键：
 - [x] 建立可重置的 checkout 故障工程，验证修复前失败、预期最小修复后 5 项测试全部通过
 - [x] 使用真实模型完成可复现 bug 的定位、一行最小修复和 5/5 测试验证
 - [x] 实现运行时约束的 `PLAN → EXECUTE → VERIFY → DONE` 状态机
+- [x] 确定性检测 Rust、Python、Node.js、Maven、Gradle、Go 和 .NET 项目并选择验证命令
 
 ## Plan → Execute → Verify
 
@@ -59,6 +60,18 @@ TUI 快捷键：
 - 只有明确的 test/build/lint/program 命令且真实 `exit_code: 0` 才更新 `last_verified_revision`。
 - 发生过写入时，仅当 `last_verified_revision == workspace_revision` 才允许进入 `DONE`。模型的文本声明不能绕过该约束。
 - TUI 事件栏展示 `PLAN / EXEC / VERIFY / DONE`，Runtime 区域展示当前 revision 及验证状态。
+
+## 自动项目检测
+
+Agent 优先读取 workspace 根目录中的确定性标志，并把结果注入 PLAN 和 VERIFY：
+
+- `Cargo.toml` → `cargo test`
+- `pyproject.toml` / pytest 配置 → `python -m pytest`
+- `tests/*.py` → `python -m unittest discover -s tests -v`
+- `package.json` → 优先 `npm test`，否则选择 build/lint script
+- `pom.xml` / Gradle 配置 / `go.mod` / `.sln` / `.csproj` → 对应原生测试命令
+
+检测不到时不猜测或安装依赖，而是让模型根据已读取的项目配置选择验证命令。命令仍必须经过安全策略并真实返回退出码 0。
 
 ## 已实现的终止与错误路径
 

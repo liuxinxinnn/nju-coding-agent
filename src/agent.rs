@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::context::ContextManager;
 use crate::error::{Error, Result};
 use crate::llm::{LanguageModel, Message};
+use crate::project::ProjectProfile;
 use crate::tool::ToolRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +29,11 @@ impl AgentPhase {
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    ProjectDetected {
+        kind: String,
+        evidence: Vec<String>,
+        verification_command: Option<String>,
+    },
     PhaseChanged {
         phase: AgentPhase,
     },
@@ -80,6 +86,7 @@ pub struct Agent {
     phase: AgentPhase,
     workspace_revision: u64,
     last_verified_revision: Option<u64>,
+    project: ProjectProfile,
 }
 
 impl Agent {
@@ -90,16 +97,18 @@ impl Agent {
         max_steps: usize,
         context_window_tokens: u64,
     ) -> Self {
+        let project = ProjectProfile::detect(workspace);
         Self {
             model,
             tools,
-            messages: vec![Message::system(system_prompt(workspace))],
+            messages: vec![Message::system(system_prompt(workspace, &project))],
             max_steps: max_steps.max(2),
             context: ContextManager::new(context_window_tokens),
             event_handler: None,
             phase: AgentPhase::Done,
             workspace_revision: 0,
             last_verified_revision: None,
+            project,
         }
     }
 
@@ -126,6 +135,10 @@ impl Agent {
         self.last_verified_revision
     }
 
+    pub const fn project_profile(&self) -> &ProjectProfile {
+        &self.project
+    }
+
     pub async fn run_turn(&mut self, task: &str) -> Result<String> {
         if task.trim().is_empty() {
             return Err(Error::Agent("task cannot be empty".to_owned()));
@@ -134,8 +147,14 @@ impl Agent {
         let definitions = self.tools.definitions();
         let planning_definitions = planning_tool_definitions(&definitions);
         let mut call_cache = BTreeMap::<String, (usize, String)>::new();
+        self.emit(AgentEvent::ProjectDetected {
+            kind: self.project.kind.label().to_owned(),
+            evidence: self.project.evidence.clone(),
+            verification_command: self.project.verification_command.clone(),
+        });
         self.transition_to(AgentPhase::Planning);
-        self.messages.push(Message::system(planning_prompt()));
+        self.messages
+            .push(Message::system(planning_prompt(&self.project)));
 
         for step in 1..=self.max_steps {
             if self.phase != AgentPhase::Planning && step == self.max_steps.saturating_sub(1) {
@@ -183,7 +202,8 @@ impl Agent {
                         plan: final_text.clone(),
                     });
                     self.transition_to(AgentPhase::Executing);
-                    self.messages.push(Message::system(execution_prompt()));
+                    self.messages
+                        .push(Message::system(execution_prompt(&self.project)));
                     continue;
                 }
                 if self.can_finish() {
@@ -199,6 +219,7 @@ impl Agent {
                 self.messages.push(Message::system(finish_blocked_prompt(
                     self.workspace_revision,
                     self.last_verified_revision,
+                    &self.project,
                 )));
                 continue;
             }
@@ -239,7 +260,7 @@ impl Agent {
 
                 let verification_command =
                     command_argument(&call.function.name, &call.function.arguments)
-                        .filter(|command| is_verification_command(command));
+                        .filter(|command| is_project_verification_command(command, &self.project));
                 if verification_command.is_some() {
                     self.transition_to(AgentPhase::Verifying);
                 } else if self.phase != AgentPhase::Planning
@@ -334,6 +355,19 @@ impl Agent {
             return;
         }
         match event {
+            AgentEvent::ProjectDetected {
+                kind,
+                evidence,
+                verification_command,
+            } => println!(
+                "[detect] {kind} · {} · verify: {}",
+                if evidence.is_empty() {
+                    "no manifest".to_owned()
+                } else {
+                    evidence.join(", ")
+                },
+                verification_command.unwrap_or_else(|| "model-selected".to_owned())
+            ),
             AgentEvent::PhaseChanged { phase } => println!("[phase:{}]", phase.label()),
             AgentEvent::PlanCreated { plan } => println!("[plan]\n{plan}"),
             AgentEvent::Thinking { step, phase } => {
@@ -455,6 +489,14 @@ fn is_verification_command(command: &str) -> bool {
     }) || is_python_script_command(&normalized)
 }
 
+fn is_project_verification_command(command: &str, project: &ProjectProfile) -> bool {
+    is_verification_command(command)
+        || project
+            .verification_command
+            .as_deref()
+            .is_some_and(|expected| command.trim().eq_ignore_ascii_case(expected.trim()))
+}
+
 fn is_python_script_command(command: &str) -> bool {
     let mut parts = command.split_whitespace();
     matches!(parts.next(), Some("python" | "python3" | "py"))
@@ -475,30 +517,42 @@ fn append_runtime_note(observation: &mut String, note: &str) {
     observation.push_str(note);
 }
 
-fn planning_prompt() -> &'static str {
-    "PLAN phase. Understand the task before changing anything. You may inspect the workspace only with read_file, list_files, and search_text. Do not run commands or modify files. When you have enough evidence, return a concise numbered plan with the intended change and verification strategy, without tool calls. This response is a plan, not the final answer."
-}
-
-fn execution_prompt() -> &'static str {
-    "The plan is recorded. Enter EXECUTE: inspect as needed, make the smallest correct changes, and use file tools rather than shell commands for edits. After any successful write_file or replace_text, the runtime advances workspace_revision and blocks DONE until a recognized test, build, lint, or program command exits with code 0 for that same revision."
-}
-
-fn finish_blocked_prompt(workspace_revision: u64, last_verified_revision: Option<u64>) -> String {
+fn planning_prompt(project: &ProjectProfile) -> String {
     format!(
-        "Runtime invariant blocked DONE: workspace revision {workspace_revision} is not verified (last verified revision: {}). Enter VERIFY now and call run_command with an appropriate real test, build, lint, or program command. A textual claim is not verification; the command must exit with code 0.",
-        last_verified_revision.map_or_else(|| "none".to_owned(), |value| value.to_string())
+        "PLAN phase. Understand the task before changing anything. You may inspect the workspace only with read_file, list_files, and search_text. Do not run commands or modify files. When you have enough evidence, return a concise numbered plan with the intended change and verification strategy, without tool calls. This response is a plan, not the final answer. {}",
+        project.prompt_hint()
     )
 }
 
-fn system_prompt(workspace: &Path) -> String {
+fn execution_prompt(project: &ProjectProfile) -> String {
+    format!(
+        "The plan is recorded. Enter EXECUTE: inspect as needed, make the smallest correct changes, and use file tools rather than shell commands for edits. After any successful write_file or replace_text, the runtime advances workspace_revision and blocks DONE until a recognized test, build, lint, or program command exits with code 0 for that same revision. {}",
+        project.prompt_hint()
+    )
+}
+
+fn finish_blocked_prompt(
+    workspace_revision: u64,
+    last_verified_revision: Option<u64>,
+    project: &ProjectProfile,
+) -> String {
+    format!(
+        "Runtime invariant blocked DONE: workspace revision {workspace_revision} is not verified (last verified revision: {}). Enter VERIFY now and call run_command with an appropriate real test, build, lint, or program command. A textual claim is not verification; the command must exit with code 0. {}",
+        last_verified_revision.map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        project.prompt_hint()
+    )
+}
+
+fn system_prompt(workspace: &Path, project: &ProjectProfile) -> String {
     format!(
         "You are a careful coding agent working only inside this workspace: {}\n\
          Every requested file must remain inside that workspace. If the user asks for a path outside it, explain that they must restart the agent with that path as --workspace; never bypass the file sandbox through shell commands. \
          Follow the runtime-controlled PLAN -> EXECUTE -> VERIFY phases. Inspect relevant files before editing. Always use write_file to create files and replace_text for small edits; never use run_command, shell redirection, or PowerShell file commands to create or edit files. Use run_command only to build, test, lint, or run the resulting project. A command result may be reused while the workspace is unchanged, but the same verification command must run again after a successful file edit. Tool errors \
          are observations: correct the request instead of pretending it succeeded. Never request \
          secrets or bypass the sandbox and command policy. When the task is complete, respond with \
-         a concise summary of changes and verification performed.",
-        human_path(workspace)
+         a concise summary of changes and verification performed. {}",
+        human_path(workspace),
+        project.prompt_hint()
     )
 }
 

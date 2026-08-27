@@ -69,6 +69,8 @@ struct App {
     phase: AgentPhase,
     workspace_revision: u64,
     last_verified_revision: Option<u64>,
+    project_kind: String,
+    verification_command: Option<String>,
     should_quit: bool,
     show_help: bool,
     events_collapsed: bool,
@@ -96,6 +98,8 @@ impl App {
             phase: AgentPhase::Done,
             workspace_revision: 0,
             last_verified_revision: None,
+            project_kind: "待检测".to_owned(),
+            verification_command: None,
             should_quit: false,
             show_help: false,
             events_collapsed: false,
@@ -133,6 +137,26 @@ impl App {
                 self.status = "执行中".to_owned();
             }
             WorkerEvent::Agent(event) => match event {
+                AgentEvent::ProjectDetected {
+                    kind,
+                    evidence,
+                    verification_command,
+                } => {
+                    self.project_kind = kind.clone();
+                    self.verification_command = verification_command.clone();
+                    self.push_event(
+                        EventKind::Detect,
+                        format!(
+                            "{kind} · {} · {}",
+                            if evidence.is_empty() {
+                                "无标志文件".to_owned()
+                            } else {
+                                evidence.join(", ")
+                            },
+                            verification_command.unwrap_or_else(|| "由模型选择验证".to_owned())
+                        ),
+                    );
+                }
                 AgentEvent::PhaseChanged { phase } => {
                     self.phase = phase;
                     self.status = phase_status(phase).to_owned();
@@ -288,11 +312,13 @@ impl App {
             "/status" => self.push_message(
                 MessageRole::System,
                 format!(
-                    "状态：{}\n阶段：{}\n版本：rev {} / {}\n模型：{}\nWorkspace：{}",
+                    "状态：{}\n阶段：{}\n版本：rev {} / {}\n项目：{}\n验证：{}\n模型：{}\nWorkspace：{}",
                     self.status,
                     self.phase.label(),
                     self.workspace_revision,
                     verification_label(self.workspace_revision, self.last_verified_revision),
+                    self.project_kind,
+                    self.verification_command.as_deref().unwrap_or("模型选择"),
                     self.model,
                     self.workspace.display()
                 ),
@@ -539,6 +565,11 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             app.phase.label(),
             app.workspace_revision,
             verification_label(app.workspace_revision, app.last_verified_revision)
+        )),
+        Line::from(format!(
+            "项目  {} · {}",
+            app.project_kind,
+            app.verification_command.as_deref().unwrap_or("模型选择")
         )),
         Line::from(format!("模型  {}", app.model)),
     ])

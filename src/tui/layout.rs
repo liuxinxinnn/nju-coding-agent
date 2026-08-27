@@ -14,7 +14,7 @@ pub(super) fn split(area: Rect, events_collapsed: bool) -> Option<Areas> {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(5),
             Constraint::Length(5),
             Constraint::Length(1),
