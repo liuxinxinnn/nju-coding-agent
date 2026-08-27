@@ -43,6 +43,7 @@ CLI
 
 - [已完成] 基于字符估算的上下文预算，中文按更保守的每字符一 token 计算。
 - [已完成] 超过 80% 自动压缩，保留 system prompt、最近完整用户轮次和工具调用链。
+- [已完成] 会话本地持久化以及 `/new`、`/sessions`、`/switch`、`/delete`，切换时恢复消息和 PEV revision 状态。
 - 流式文本输出、token 用量和可读执行轨迹。
 - 可配置 allow/block 命令规则。
 

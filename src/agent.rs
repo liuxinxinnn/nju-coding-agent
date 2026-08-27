@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::context::ContextManager;
 use crate::error::{Error, Result};
-use crate::llm::{LanguageModel, Message};
+use crate::llm::{LanguageModel, Message, Role};
 use crate::project::ProjectProfile;
 use crate::tool::ToolRegistry;
 
@@ -25,6 +27,13 @@ impl AgentPhase {
             Self::Done => "DONE",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentState {
+    pub messages: Vec<Message>,
+    pub workspace_revision: u64,
+    pub last_verified_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +96,7 @@ pub struct Agent {
     workspace_revision: u64,
     last_verified_revision: Option<u64>,
     project: ProjectProfile,
+    initial_system_message: Message,
 }
 
 impl Agent {
@@ -98,10 +108,11 @@ impl Agent {
         context_window_tokens: u64,
     ) -> Self {
         let project = ProjectProfile::detect(workspace);
+        let initial_system_message = Message::system(system_prompt(workspace, &project));
         Self {
             model,
             tools,
-            messages: vec![Message::system(system_prompt(workspace, &project))],
+            messages: vec![initial_system_message.clone()],
             max_steps: max_steps.max(2),
             context: ContextManager::new(context_window_tokens),
             event_handler: None,
@@ -109,6 +120,7 @@ impl Agent {
             workspace_revision: 0,
             last_verified_revision: None,
             project,
+            initial_system_message,
         }
     }
 
@@ -137,6 +149,43 @@ impl Agent {
 
     pub const fn project_profile(&self) -> &ProjectProfile {
         &self.project
+    }
+
+    pub fn export_state(&self) -> AgentState {
+        AgentState {
+            messages: self.messages.clone(),
+            workspace_revision: self.workspace_revision,
+            last_verified_revision: self.last_verified_revision,
+        }
+    }
+
+    pub fn restore_state(&mut self, mut state: AgentState) -> Result<()> {
+        if state.messages.is_empty() || state.messages[0].role != Role::System {
+            return Err(Error::Agent(
+                "saved session must start with a system message".to_owned(),
+            ));
+        }
+        if state
+            .last_verified_revision
+            .is_some_and(|revision| revision > state.workspace_revision)
+        {
+            return Err(Error::Agent(
+                "saved session has an invalid verified revision".to_owned(),
+            ));
+        }
+        state.messages[0] = self.initial_system_message.clone();
+        self.messages = state.messages;
+        self.workspace_revision = state.workspace_revision;
+        self.last_verified_revision = state.last_verified_revision;
+        self.phase = AgentPhase::Done;
+        Ok(())
+    }
+
+    pub fn reset_state(&mut self) {
+        self.messages = vec![self.initial_system_message.clone()];
+        self.workspace_revision = 0;
+        self.last_verified_revision = None;
+        self.phase = AgentPhase::Done;
     }
 
     pub async fn run_turn(&mut self, task: &str) -> Result<String> {
@@ -585,7 +634,7 @@ mod tests {
     use crate::llm::{FunctionCall, LanguageModel, Message, Role, ToolCall, ToolDefinition};
     use crate::tool::{Tool, ToolRegistry};
 
-    use super::Agent;
+    use super::{Agent, AgentState};
 
     struct MockModel {
         responses: Mutex<VecDeque<Message>>,
@@ -957,5 +1006,61 @@ mod tests {
         for command in ["echo ok", "python --version", "git status", "dir"] {
             assert!(!super::is_verification_command(command), "{command}");
         }
+    }
+
+    #[test]
+    fn restores_and_resets_persisted_conversation_state() {
+        let model = Arc::new(MockModel {
+            responses: Mutex::new(VecDeque::new()),
+        });
+        let workspace = tempdir().expect("workspace");
+        let mut agent = Agent::new(model, ToolRegistry::new(), workspace.path(), 5, 128_000);
+        let state = AgentState {
+            messages: vec![
+                Message::system("old system prompt"),
+                Message::user("first turn"),
+                Message::assistant("first answer"),
+            ],
+            workspace_revision: 3,
+            last_verified_revision: Some(3),
+        };
+
+        agent.restore_state(state).expect("restore state");
+
+        assert_eq!(agent.workspace_revision(), 3);
+        assert_eq!(agent.last_verified_revision(), Some(3));
+        assert_eq!(agent.messages()[1], Message::user("first turn"));
+        assert_eq!(agent.messages()[2], Message::assistant("first answer"));
+        assert_ne!(
+            agent.messages()[0].content.as_deref(),
+            Some("old system prompt")
+        );
+
+        agent.reset_state();
+
+        assert_eq!(agent.messages().len(), 1);
+        assert_eq!(agent.messages()[0].role, Role::System);
+        assert_eq!(agent.workspace_revision(), 0);
+        assert_eq!(agent.last_verified_revision(), None);
+    }
+
+    #[test]
+    fn rejects_persisted_verification_ahead_of_workspace_revision() {
+        let model = Arc::new(MockModel {
+            responses: Mutex::new(VecDeque::new()),
+        });
+        let workspace = tempdir().expect("workspace");
+        let mut agent = Agent::new(model, ToolRegistry::new(), workspace.path(), 5, 128_000);
+
+        let error = agent
+            .restore_state(AgentState {
+                messages: vec![Message::system("system")],
+                workspace_revision: 1,
+                last_verified_revision: Some(2),
+            })
+            .expect_err("invalid revision must be rejected");
+
+        assert!(error.to_string().contains("invalid verified revision"));
+        assert_eq!(agent.workspace_revision(), 0);
     }
 }

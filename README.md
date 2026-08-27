@@ -35,7 +35,7 @@ TUI 快捷键：
 - `Up/Down`、`PageUp/PageDown`、`Home/End` 滚动对话。
 - `Ctrl+P/N` 浏览输入历史，`Ctrl+L` 折叠事件栏。
 - `F1` 帮助，`Ctrl+D` 退出。
-- 内置命令：`/help`、`/clear`、`/status`、`/tools`、`/exit`。
+- 内置命令：`/new`、`/sessions`、`/switch <id>`、`/delete <id>`、`/help`、`/clear`、`/status`、`/tools`、`/exit`。
 
 ## 当前里程碑
 
@@ -52,6 +52,7 @@ TUI 快捷键：
 - [x] 使用真实模型完成可复现 bug 的定位、一行最小修复和 5/5 测试验证
 - [x] 实现运行时约束的 `PLAN → EXECUTE → VERIFY → DONE` 状态机
 - [x] 确定性检测 Rust、Python、Node.js、Maven、Gradle、Go 和 .NET 项目并选择验证命令
+- [x] 本地持久化多轮会话，支持新建、列表、切换和删除
 
 ## Plan → Execute → Verify
 
@@ -72,6 +73,17 @@ Agent 优先读取 workspace 根目录中的确定性标志，并把结果注入
 - `pom.xml` / Gradle 配置 / `go.mod` / `.sln` / `.csproj` → 对应原生测试命令
 
 检测不到时不猜测或安装依赖，而是让模型根据已读取的项目配置选择验证命令。命令仍必须经过安全策略并真实返回退出码 0。
+
+## 多轮会话
+
+TUI 启动时自动恢复当前 workspace 最近使用的会话。每个会话独立保存完整消息历史、workspace、`workspace_revision` 和 `last_verified_revision`，所以切换回来后可以继续原有上下文与验证状态：
+
+- `/new`：保存当前会话并新建空会话。
+- `/sessions`：列出当前 workspace 的会话；`*` 表示当前会话。
+- `/switch <id>`：按完整 ID 或唯一前缀切换并恢复对话。
+- `/delete <id>`：删除会话；删除当前会话时会自动建立一个空会话。
+
+Windows 默认保存到 `%LOCALAPPDATA%\nju-coding-agent\sessions`；也可通过 `CODING_AGENT_DATA_DIR` 指定本地数据根目录。回退目录 `.nju-coding-agent-data/` 已加入 Git 忽略。会话中可能包含代码和用户输入，因此这些 JSON 文件只用于本机运行，不进入仓库。
 
 ## 已实现的终止与错误路径
 

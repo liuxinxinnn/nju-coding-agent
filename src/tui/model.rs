@@ -86,6 +86,7 @@ impl ChatMessage {
 
 #[derive(Clone, Copy)]
 pub(super) enum EventKind {
+    Session,
     Detect,
     Plan,
     Execute,
@@ -101,6 +102,7 @@ pub(super) enum EventKind {
 impl EventKind {
     fn label(self) -> &'static str {
         match self {
+            Self::Session => "SESSION",
             Self::Detect => "DETECT",
             Self::Plan => "PLAN",
             Self::Execute => "EXEC",
@@ -116,6 +118,7 @@ impl EventKind {
 
     fn style(self) -> Style {
         match self {
+            Self::Session => Style::default().fg(Color::Black).bg(Color::LightGreen),
             Self::Detect => Style::default().fg(Color::Black).bg(Color::LightCyan),
             Self::Plan => Style::default().fg(Color::Black).bg(Color::LightYellow),
             Self::Execute => Style::default().fg(Color::Black).bg(Color::LightBlue),

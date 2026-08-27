@@ -18,6 +18,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
 use crate::agent::{AgentEvent, AgentPhase};
+use crate::llm::{Message, Role};
+use crate::session::{SessionStore, SessionSummary, StoredSession};
 use crate::tools::{ApprovalFn, default_registry_with_approval};
 use crate::{Agent, Config, HttpLanguageModel, Result};
 
@@ -34,16 +36,35 @@ const MAX_EVENTS: usize = 500;
 
 enum WorkerCommand {
     Chat(String),
+    NewSession,
+    ListSessions,
+    SwitchSession(String),
+    DeleteSession(String),
     Shutdown,
 }
 
 enum WorkerEvent {
     Ready {
         tools: Vec<String>,
+        data_dir: PathBuf,
+        project_kind: String,
+        verification_command: Option<String>,
     },
     Started,
     Agent(AgentEvent),
     Done(std::result::Result<String, String>),
+    SessionChanged {
+        id: String,
+        title: String,
+        messages: Vec<Message>,
+        workspace_revision: u64,
+        last_verified_revision: Option<u64>,
+    },
+    SessionList {
+        current_id: String,
+        sessions: Vec<SessionSummary>,
+    },
+    Notice(String),
     Confirm {
         prompt: String,
         response: std_mpsc::Sender<bool>,
@@ -71,6 +92,8 @@ struct App {
     last_verified_revision: Option<u64>,
     project_kind: String,
     verification_command: Option<String>,
+    session_id: String,
+    session_data_dir: Option<PathBuf>,
     should_quit: bool,
     show_help: bool,
     events_collapsed: bool,
@@ -100,6 +123,8 @@ impl App {
             last_verified_revision: None,
             project_kind: "待检测".to_owned(),
             verification_command: None,
+            session_id: "初始化".to_owned(),
+            session_data_dir: None,
             should_quit: false,
             show_help: false,
             events_collapsed: false,
@@ -127,8 +152,16 @@ impl App {
 
     fn apply_worker_event(&mut self, event: WorkerEvent) {
         match event {
-            WorkerEvent::Ready { tools } => {
+            WorkerEvent::Ready {
+                tools,
+                data_dir,
+                project_kind,
+                verification_command,
+            } => {
                 self.tools = tools;
+                self.session_data_dir = Some(data_dir);
+                self.project_kind = project_kind;
+                self.verification_command = verification_command;
                 self.status = "就绪".to_owned();
                 self.push_event(EventKind::Info, "Agent 初始化完成");
             }
@@ -262,6 +295,41 @@ impl App {
                     }
                 }
             }
+            WorkerEvent::SessionChanged {
+                id,
+                title,
+                messages,
+                workspace_revision,
+                last_verified_revision,
+            } => {
+                self.session_id = id.clone();
+                self.workspace_revision = workspace_revision;
+                self.last_verified_revision = last_verified_revision;
+                self.phase = AgentPhase::Done;
+                self.status = "就绪".to_owned();
+                self.busy = false;
+                self.history = History::default();
+                self.restore_transcript(&id, &title, &messages);
+                self.events.clear();
+                self.push_event(
+                    EventKind::Session,
+                    format!("当前会话 {} · {title}", short_session_id(&id)),
+                );
+            }
+            WorkerEvent::SessionList {
+                current_id,
+                sessions,
+            } => {
+                self.push_message(
+                    MessageRole::System,
+                    format_session_list(&current_id, &sessions),
+                );
+                self.push_event(EventKind::Session, format!("共 {} 个会话", sessions.len()));
+            }
+            WorkerEvent::Notice(message) => {
+                self.push_message(MessageRole::System, message.clone());
+                self.push_event(EventKind::Session, message);
+            }
             WorkerEvent::Confirm { prompt, response } => {
                 self.pending_confirmation = Some(PendingConfirmation { prompt, response });
             }
@@ -274,6 +342,35 @@ impl App {
         }
     }
 
+    fn restore_transcript(&mut self, id: &str, title: &str, messages: &[Message]) {
+        self.messages.clear();
+        self.push_message(
+            MessageRole::System,
+            format!("会话 {} · {title}", short_session_id(id)),
+        );
+        for (index, message) in messages.iter().enumerate() {
+            let Some(content) = message
+                .content
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+            else {
+                continue;
+            };
+            match message.role {
+                Role::User => self.push_message(MessageRole::User, content),
+                Role::Assistant if message.tool_calls.is_none() => {
+                    let role = if is_plan_message(messages, index) {
+                        MessageRole::Plan
+                    } else {
+                        MessageRole::Agent
+                    };
+                    self.push_message(role, content);
+                }
+                Role::System | Role::Assistant | Role::Tool => {}
+            }
+        }
+    }
+
     fn submit(&mut self, command_tx: &mpsc::UnboundedSender<WorkerCommand>) {
         let text = self.input.text();
         let trimmed = text.trim();
@@ -281,7 +378,7 @@ impl App {
             return;
         }
         if trimmed.starts_with('/') {
-            self.handle_command(trimmed);
+            self.handle_command(trimmed, command_tx);
             self.input.clear();
             return;
         }
@@ -297,8 +394,10 @@ impl App {
         }
     }
 
-    fn handle_command(&mut self, command: &str) {
-        match command {
+    fn handle_command(&mut self, command: &str, command_tx: &mpsc::UnboundedSender<WorkerCommand>) {
+        let mut parts = command.split_whitespace();
+        let name = parts.next().unwrap_or_default();
+        match name {
             "/exit" | "/quit" => self.should_quit = true,
             "/help" => self.show_help = !self.show_help,
             "/clear" => {
@@ -312,15 +411,19 @@ impl App {
             "/status" => self.push_message(
                 MessageRole::System,
                 format!(
-                    "状态：{}\n阶段：{}\n版本：rev {} / {}\n项目：{}\n验证：{}\n模型：{}\nWorkspace：{}",
+                    "状态：{}\n会话：{}\n阶段：{}\n版本：rev {} / {}\n项目：{}\n验证：{}\n模型：{}\nWorkspace：{}\n会话目录：{}",
                     self.status,
+                    self.session_id,
                     self.phase.label(),
                     self.workspace_revision,
                     verification_label(self.workspace_revision, self.last_verified_revision),
                     self.project_kind,
                     self.verification_command.as_deref().unwrap_or("模型选择"),
                     self.model,
-                    self.workspace.display()
+                    self.workspace.display(),
+                    self.session_data_dir
+                        .as_deref()
+                        .map_or_else(|| "初始化中".to_owned(), display_path)
                 ),
             ),
             "/tools" => {
@@ -331,7 +434,39 @@ impl App {
                 };
                 self.push_message(MessageRole::System, format!("可用工具：\n- {tools}"));
             }
+            "/new" if parts.next().is_none() => {
+                self.send_session_command(command_tx, WorkerCommand::NewSession)
+            }
+            "/sessions" if parts.next().is_none() => {
+                self.send_session_command(command_tx, WorkerCommand::ListSessions)
+            }
+            "/switch" => match (parts.next(), parts.next()) {
+                (Some(id), None) => self.send_session_command(
+                    command_tx,
+                    WorkerCommand::SwitchSession(id.to_owned()),
+                ),
+                _ => self.push_message(MessageRole::Error, "用法：/switch <id>"),
+            },
+            "/delete" => match (parts.next(), parts.next()) {
+                (Some(id), None) => self.send_session_command(
+                    command_tx,
+                    WorkerCommand::DeleteSession(id.to_owned()),
+                ),
+                _ => self.push_message(MessageRole::Error, "用法：/delete <id>"),
+            },
             _ => self.push_message(MessageRole::Error, format!("未知命令：{command}")),
+        }
+    }
+
+    fn send_session_command(
+        &mut self,
+        command_tx: &mpsc::UnboundedSender<WorkerCommand>,
+        command: WorkerCommand,
+    ) {
+        if self.busy {
+            self.push_event(EventKind::Info, "Agent 执行中，暂不能切换会话");
+        } else if command_tx.send(command).is_err() {
+            self.push_message(MessageRole::Error, "Agent worker 已停止");
         }
     }
 
@@ -379,8 +514,12 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     app.resolve_confirmation(false);
-    let _ = command_tx.send(WorkerCommand::Shutdown);
-    worker.abort();
+    if app.busy {
+        worker.abort();
+    } else {
+        let _ = command_tx.send(WorkerCommand::Shutdown);
+        let _ = worker.await;
+    }
     Ok(())
 }
 
@@ -441,7 +580,43 @@ async fn worker_loop(
     agent.on_event(move |event| {
         let _ = agent_events.send(WorkerEvent::Agent(event));
     });
-    let _ = event_tx.send(WorkerEvent::Ready { tools: tool_names });
+    let store = match SessionStore::open_default() {
+        Ok(store) => store,
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::Fatal(format!("无法初始化会话存储：{error}")));
+            return;
+        }
+    };
+    let mut current_session = match store.latest_for_workspace(&config.workspace) {
+        Ok(Some(session)) => {
+            if let Err(error) = agent.restore_state(session.state.clone()) {
+                let _ = event_tx.send(WorkerEvent::Fatal(format!(
+                    "无法恢复会话 {}: {error}",
+                    session.id
+                )));
+                return;
+            }
+            session
+        }
+        Ok(None) => match store.create(&config.workspace, agent.export_state()) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = event_tx.send(WorkerEvent::Fatal(format!("无法创建会话：{error}")));
+                return;
+            }
+        },
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::Fatal(format!("无法读取会话：{error}")));
+            return;
+        }
+    };
+    let _ = event_tx.send(WorkerEvent::Ready {
+        tools: tool_names,
+        data_dir: store.root().to_path_buf(),
+        project_kind: agent.project_profile().kind.label().to_owned(),
+        verification_command: agent.project_profile().verification_command.clone(),
+    });
+    send_session_changed(&event_tx, &current_session);
 
     while let Some(command) = command_rx.recv().await {
         match command {
@@ -451,11 +626,135 @@ async fn worker_loop(
                     .run_turn(&task)
                     .await
                     .map_err(|error| error.to_string());
+                current_session.update(agent.export_state(), Some(&task));
+                if let Err(error) = store.save(&current_session) {
+                    let _ = event_tx.send(WorkerEvent::Notice(format!("会话保存失败：{error}")));
+                }
                 let _ = event_tx.send(WorkerEvent::Done(result));
             }
-            WorkerCommand::Shutdown => break,
+            WorkerCommand::NewSession => {
+                current_session.update(agent.export_state(), None);
+                if let Err(error) = store.save(&current_session) {
+                    let _ =
+                        event_tx.send(WorkerEvent::Notice(format!("当前会话保存失败：{error}")));
+                    continue;
+                }
+                agent.reset_state();
+                match store.create(&config.workspace, agent.export_state()) {
+                    Ok(session) => {
+                        current_session = session;
+                        send_session_changed(&event_tx, &current_session);
+                    }
+                    Err(error) => {
+                        let _ = agent.restore_state(current_session.state.clone());
+                        let _ =
+                            event_tx.send(WorkerEvent::Notice(format!("新建会话失败：{error}")));
+                    }
+                }
+            }
+            WorkerCommand::ListSessions => match store.list_for_workspace(&config.workspace) {
+                Ok(sessions) => {
+                    let _ = event_tx.send(WorkerEvent::SessionList {
+                        current_id: current_session.id.clone(),
+                        sessions,
+                    });
+                }
+                Err(error) => {
+                    let _ =
+                        event_tx.send(WorkerEvent::Notice(format!("读取会话列表失败：{error}")));
+                }
+            },
+            WorkerCommand::SwitchSession(query) => {
+                current_session.update(agent.export_state(), None);
+                if let Err(error) = store.save(&current_session) {
+                    let _ =
+                        event_tx.send(WorkerEvent::Notice(format!("当前会话保存失败：{error}")));
+                    continue;
+                }
+                match store.load(&query) {
+                    Ok(session) if !session.belongs_to(&config.workspace) => {
+                        let _ = event_tx.send(WorkerEvent::Notice(
+                            "不能切换到其他 workspace 的会话；请用对应 --workspace 重启".to_owned(),
+                        ));
+                    }
+                    Ok(session) => match agent.restore_state(session.state.clone()) {
+                        Ok(()) => {
+                            current_session = session;
+                            send_session_changed(&event_tx, &current_session);
+                        }
+                        Err(error) => {
+                            let _ = event_tx
+                                .send(WorkerEvent::Notice(format!("会话恢复失败：{error}")));
+                        }
+                    },
+                    Err(error) => {
+                        let _ =
+                            event_tx.send(WorkerEvent::Notice(format!("会话切换失败：{error}")));
+                    }
+                }
+            }
+            WorkerCommand::DeleteSession(query) => match store.load(&query) {
+                Ok(session) if session.id == current_session.id => {
+                    let previous_state = agent.export_state();
+                    agent.reset_state();
+                    match store.create(&config.workspace, agent.export_state()) {
+                        Ok(replacement) => match store.delete(&session.id) {
+                            Ok(id) => {
+                                current_session = replacement;
+                                send_session_changed(&event_tx, &current_session);
+                                let _ =
+                                    event_tx.send(WorkerEvent::Notice(format!("已删除会话 {id}")));
+                            }
+                            Err(error) => {
+                                let _ = store.delete(&replacement.id);
+                                let _ = agent.restore_state(previous_state);
+                                let _ = event_tx
+                                    .send(WorkerEvent::Notice(format!("删除会话失败：{error}")));
+                            }
+                        },
+                        Err(error) => {
+                            let _ = agent.restore_state(previous_state);
+                            let _ = event_tx.send(WorkerEvent::Notice(format!(
+                                "删除当前会话前无法创建替代会话：{error}"
+                            )));
+                        }
+                    }
+                }
+                Ok(session) if !session.belongs_to(&config.workspace) => {
+                    let _ = event_tx.send(WorkerEvent::Notice(
+                        "不能删除其他 workspace 的会话".to_owned(),
+                    ));
+                }
+                Ok(session) => match store.delete(&session.id) {
+                    Ok(id) => {
+                        let _ = event_tx.send(WorkerEvent::Notice(format!("已删除会话 {id}")));
+                    }
+                    Err(error) => {
+                        let _ =
+                            event_tx.send(WorkerEvent::Notice(format!("删除会话失败：{error}")));
+                    }
+                },
+                Err(error) => {
+                    let _ = event_tx.send(WorkerEvent::Notice(format!("删除会话失败：{error}")));
+                }
+            },
+            WorkerCommand::Shutdown => {
+                current_session.update(agent.export_state(), None);
+                let _ = store.save(&current_session);
+                break;
+            }
         }
     }
+}
+
+fn send_session_changed(event_tx: &mpsc::UnboundedSender<WorkerEvent>, session: &StoredSession) {
+    let _ = event_tx.send(WorkerEvent::SessionChanged {
+        id: session.id.clone(),
+        title: session.title.clone(),
+        messages: session.state.messages.clone(),
+        workspace_revision: session.state.workspace_revision,
+        last_verified_revision: session.state.last_verified_revision,
+    });
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, command_tx: &mpsc::UnboundedSender<WorkerCommand>) {
@@ -544,6 +843,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(format!("Workspace  {}", display_path(&app.workspace))),
+        Line::from(format!("Session    {}", short_session_id(&app.session_id))),
         Line::from("F1 帮助 · Ctrl+L 事件栏 · Ctrl+D 退出"),
     ])
     .block(Block::default().borders(Borders::ALL).title("Workspace"));
@@ -703,5 +1003,98 @@ fn verification_label(workspace_revision: u64, last_verified_revision: Option<u6
         "✓".to_owned()
     } else {
         "未验证".to_owned()
+    }
+}
+
+fn short_session_id(id: &str) -> String {
+    const LIMIT: usize = 22;
+    if id.chars().count() <= LIMIT {
+        id.to_owned()
+    } else {
+        format!("{}…", id.chars().take(LIMIT).collect::<String>())
+    }
+}
+
+fn is_plan_message(messages: &[Message], index: usize) -> bool {
+    messages.get(index + 1).is_some_and(|next| {
+        next.role == Role::System
+            && next
+                .content
+                .as_deref()
+                .is_some_and(|content| content.starts_with("The plan is recorded."))
+    })
+}
+
+fn format_session_list(current_id: &str, sessions: &[SessionSummary]) -> String {
+    if sessions.is_empty() {
+        return "当前 workspace 还没有保存的会话。".to_owned();
+    }
+    let mut output = String::from("会话列表：\n");
+    for session in sessions {
+        let marker = if session.id == current_id { "*" } else { " " };
+        let verification =
+            verification_label(session.workspace_revision, session.last_verified_revision);
+        output.push_str(&format!(
+            "{marker} {}  {}  rev {} {}  {}\n",
+            session.id, session.title, session.workspace_revision, verification, session.updated_at
+        ));
+    }
+    output.push_str("\n使用 /switch <id或唯一前缀> 切换。");
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use tokio::sync::mpsc;
+
+    use super::{App, WorkerCommand, format_session_list};
+    use crate::session::SessionSummary;
+
+    #[test]
+    fn session_commands_are_dispatched_with_the_requested_id() {
+        let mut app = App::new(PathBuf::from("workspace"), "model".to_owned());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        app.handle_command("/new", &sender);
+        assert!(matches!(receiver.try_recv(), Ok(WorkerCommand::NewSession)));
+
+        app.handle_command("/sessions", &sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WorkerCommand::ListSessions)
+        ));
+
+        app.handle_command("/switch abc123", &sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WorkerCommand::SwitchSession(id)) if id == "abc123"
+        ));
+
+        app.handle_command("/delete def456", &sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WorkerCommand::DeleteSession(id)) if id == "def456"
+        ));
+    }
+
+    #[test]
+    fn session_list_marks_current_and_displays_revisions() {
+        let sessions = vec![SessionSummary {
+            id: "session-123".to_owned(),
+            title: "fix checkout".to_owned(),
+            workspace: PathBuf::from("workspace"),
+            updated_at: "2026-08-27T20:00:00+08:00".to_owned(),
+            workspace_revision: 2,
+            last_verified_revision: Some(2),
+        }];
+
+        let output = format_session_list("session-123", &sessions);
+
+        assert!(output.contains("* session-123"));
+        assert!(output.contains("fix checkout"));
+        assert!(output.contains("rev 2"));
+        assert!(output.contains("/switch"));
     }
 }

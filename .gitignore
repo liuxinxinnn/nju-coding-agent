@@ -6,3 +6,4 @@
 !.env.example
 *.log
 /benchmarks/checkout_discount/workspace/
+/.nju-coding-agent-data/

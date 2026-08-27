@@ -47,6 +47,7 @@ pub(super) fn draw_help(frame: &mut Frame<'_>) {
         Line::from("  Ctrl+D / /exit  退出"),
         Line::from(String::new()),
         Line::from("命令：/help /clear /status /tools /exit"),
+        Line::from("会话：/new /sessions /switch <id> /delete <id>"),
     ];
     let panel = Paragraph::new(text)
         .block(
