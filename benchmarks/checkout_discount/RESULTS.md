@@ -9,7 +9,7 @@
 - 失败表现：应付 `90.00` 被计算为 `88.00`；应付 `0.15` 被计算为 `0.14`
 - 基线结论：故障稳定可复现
 
-## Real-model agent run
+## Pre-PEV real-model run
 
 日期：2026-08-27。模型：`deepseek-v4-flash`。任务由 `run_agent.ps1` 重置后执行，并在 Agent 结束后独立运行完整测试。
 
@@ -24,3 +24,11 @@
 | 修复摘要 | 将折扣仅应用于商品小计，再加上不参与折扣的运费；仅修改一行 |
 
 结论：第一个真实模型端到端 bug-fix benchmark 通过。执行轨迹同时暴露了两个 Agent 基础设施问题：Windows 子 PowerShell 的 UTF-8 输出、文件修改后的旧命令结果缓存。两者已在 benchmark 后修复，其中缓存行为已加入自动化回归测试。
+
+## PEV real-model rerun
+
+待用当前 `PLAN → EXECUTE → VERIFY → DONE` 实现重跑。`run_agent.ps1` 除了独立测试和测试文件哈希外，还会检查：
+
+- 轨迹最终真实进入 `DONE`。
+- 修改后的最新 `workspace_revision` 存在 `VerificationPassed`证据。
+- 输出完整阶段序列、revision、步数、工具数和耗时。

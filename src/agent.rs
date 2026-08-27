@@ -7,13 +7,40 @@ use crate::error::{Error, Result};
 use crate::llm::{LanguageModel, Message};
 use crate::tool::ToolRegistry;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentPhase {
+    Planning,
+    Executing,
+    Verifying,
+    Done,
+}
+
+impl AgentPhase {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Planning => "PLAN",
+            Self::Executing => "EXEC",
+            Self::Verifying => "VERIFY",
+            Self::Done => "DONE",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    PhaseChanged {
+        phase: AgentPhase,
+    },
+    PlanCreated {
+        plan: String,
+    },
     Thinking {
         step: usize,
+        phase: AgentPhase,
     },
     ToolCall {
         step: usize,
+        phase: AgentPhase,
         name: String,
         arguments: String,
     },
@@ -26,6 +53,19 @@ pub enum AgentEvent {
         before_tokens: u64,
         after_tokens: u64,
     },
+    WorkspaceChanged {
+        revision: u64,
+        tool_name: String,
+    },
+    VerificationFinished {
+        revision: u64,
+        command: String,
+        passed: bool,
+    },
+    FinishBlocked {
+        workspace_revision: u64,
+        last_verified_revision: Option<u64>,
+    },
 }
 
 type EventHandler = Arc<dyn Fn(AgentEvent) + Send + Sync>;
@@ -37,6 +77,9 @@ pub struct Agent {
     max_steps: usize,
     context: ContextManager,
     event_handler: Option<EventHandler>,
+    phase: AgentPhase,
+    workspace_revision: u64,
+    last_verified_revision: Option<u64>,
 }
 
 impl Agent {
@@ -51,9 +94,12 @@ impl Agent {
             model,
             tools,
             messages: vec![Message::system(system_prompt(workspace))],
-            max_steps: max_steps.max(1),
+            max_steps: max_steps.max(2),
             context: ContextManager::new(context_window_tokens),
             event_handler: None,
+            phase: AgentPhase::Done,
+            workspace_revision: 0,
+            last_verified_revision: None,
         }
     }
 
@@ -68,24 +114,49 @@ impl Agent {
         &self.messages
     }
 
+    pub const fn phase(&self) -> AgentPhase {
+        self.phase
+    }
+
+    pub const fn workspace_revision(&self) -> u64 {
+        self.workspace_revision
+    }
+
+    pub const fn last_verified_revision(&self) -> Option<u64> {
+        self.last_verified_revision
+    }
+
     pub async fn run_turn(&mut self, task: &str) -> Result<String> {
         if task.trim().is_empty() {
             return Err(Error::Agent("task cannot be empty".to_owned()));
         }
         self.messages.push(Message::user(task));
         let definitions = self.tools.definitions();
+        let planning_definitions = planning_tool_definitions(&definitions);
         let mut call_cache = BTreeMap::<String, (usize, String)>::new();
+        self.transition_to(AgentPhase::Planning);
+        self.messages.push(Message::system(planning_prompt()));
 
         for step in 1..=self.max_steps {
-            if step == self.max_steps.saturating_sub(1) {
-                self.messages.push(Message::system(
-                    "You are near the step limit. If the requested result has already been verified, do not call another tool; return the final concise summary now.",
-                ));
+            if self.phase != AgentPhase::Planning && step == self.max_steps.saturating_sub(1) {
+                self.messages.push(Message::system(if self.can_finish() {
+                    "You are near the step limit. If the requested result is complete, return the final concise summary now."
+                } else {
+                    "You are near the step limit, but the current workspace revision is unverified. Run one appropriate test, build, lint, or program verification command now; do not claim completion before it passes."
+                }));
             }
-            self.emit(AgentEvent::Thinking { step });
+            self.emit(AgentEvent::Thinking {
+                step,
+                phase: self.phase,
+            });
+            let active_definitions = if self.phase == AgentPhase::Planning {
+                &planning_definitions
+            } else {
+                &definitions
+            };
             if let Some(event) = self
                 .context
-                .compact_if_needed(&mut self.messages, &definitions)?
+                .compact_if_needed(&mut self.messages, active_definitions)?
             {
                 self.emit(AgentEvent::ContextCompressed {
                     covered_messages: event.covered_messages,
@@ -93,7 +164,10 @@ impl Agent {
                     after_tokens: event.after_tokens,
                 });
             }
-            let response = self.model.complete(&self.messages, &definitions).await?;
+            let response = self
+                .model
+                .complete(&self.messages, active_definitions)
+                .await?;
             let tool_calls = response.tool_calls.clone().unwrap_or_default();
             let final_text = response.content.clone().unwrap_or_default();
             self.messages.push(response);
@@ -104,10 +178,51 @@ impl Agent {
                         "model returned neither text nor tool calls at step {step}"
                     )));
                 }
-                return Ok(final_text);
+                if self.phase == AgentPhase::Planning {
+                    self.emit(AgentEvent::PlanCreated {
+                        plan: final_text.clone(),
+                    });
+                    self.transition_to(AgentPhase::Executing);
+                    self.messages.push(Message::system(execution_prompt()));
+                    continue;
+                }
+                if self.can_finish() {
+                    self.transition_to(AgentPhase::Done);
+                    return Ok(final_text);
+                }
+
+                self.transition_to(AgentPhase::Verifying);
+                self.emit(AgentEvent::FinishBlocked {
+                    workspace_revision: self.workspace_revision,
+                    last_verified_revision: self.last_verified_revision,
+                });
+                self.messages.push(Message::system(finish_blocked_prompt(
+                    self.workspace_revision,
+                    self.last_verified_revision,
+                )));
+                continue;
             }
 
             for call in tool_calls {
+                if self.phase == AgentPhase::Planning && !is_planning_tool(&call.function.name) {
+                    let observation = format!(
+                        "ERROR: tool '{}' is not allowed during PLAN. Inspect with read_file, list_files, or search_text, then return a concise plan without tool calls.",
+                        call.function.name
+                    );
+                    self.emit(AgentEvent::ToolCall {
+                        step,
+                        phase: self.phase,
+                        name: call.function.name.clone(),
+                        arguments: call.function.arguments.clone(),
+                    });
+                    self.emit(AgentEvent::ToolResult {
+                        name: call.function.name,
+                        result: observation.clone(),
+                    });
+                    self.messages.push(Message::tool(call.id, observation));
+                    continue;
+                }
+
                 let signature = format!("{}:{}", call.function.name, call.function.arguments);
                 if let Some((repeat_count, previous_result)) = call_cache.get_mut(&signature) {
                     *repeat_count += 1;
@@ -122,22 +237,75 @@ impl Agent {
                     continue;
                 }
 
+                let verification_command =
+                    command_argument(&call.function.name, &call.function.arguments)
+                        .filter(|command| is_verification_command(command));
+                if verification_command.is_some() {
+                    self.transition_to(AgentPhase::Verifying);
+                } else if self.phase != AgentPhase::Planning
+                    && (self.phase != AgentPhase::Verifying
+                        || is_workspace_mutation(&call.function.name))
+                {
+                    self.transition_to(AgentPhase::Executing);
+                }
+
                 self.emit(AgentEvent::ToolCall {
                     step,
+                    phase: self.phase,
                     name: call.function.name.clone(),
                     arguments: call.function.arguments.clone(),
                 });
-                let observation = self
+                let raw_observation = self
                     .tools
                     .execute(&call.function.name, &call.function.arguments)
                     .await;
                 self.emit(AgentEvent::ToolResult {
                     name: call.function.name.clone(),
-                    result: observation.clone(),
+                    result: raw_observation.clone(),
                 });
-                if invalidates_cached_observations(&call.function.name, &observation) {
+
+                let mut observation = raw_observation.clone();
+                if successful_workspace_mutation(&call.function.name, &raw_observation) {
                     call_cache.clear();
+                    self.workspace_revision = self.workspace_revision.saturating_add(1);
+                    self.emit(AgentEvent::WorkspaceChanged {
+                        revision: self.workspace_revision,
+                        tool_name: call.function.name.clone(),
+                    });
+                    append_runtime_note(
+                        &mut observation,
+                        &format!(
+                            "Workspace revision is now {}. DONE is blocked until this revision passes a real verification command.",
+                            self.workspace_revision
+                        ),
+                    );
                 }
+
+                if let Some(command) = verification_command {
+                    let passed = command_succeeded(&raw_observation);
+                    if passed {
+                        self.last_verified_revision = Some(self.workspace_revision);
+                    } else {
+                        if self.last_verified_revision == Some(self.workspace_revision) {
+                            self.last_verified_revision = None;
+                        }
+                        self.transition_to(AgentPhase::Executing);
+                    }
+                    self.emit(AgentEvent::VerificationFinished {
+                        revision: self.workspace_revision,
+                        command: command.clone(),
+                        passed,
+                    });
+                    append_runtime_note(
+                        &mut observation,
+                        if passed {
+                            "Verification passed for the current workspace revision. DONE is now allowed if the task is complete."
+                        } else {
+                            "Verification failed. Return to EXECUTE, fix the cause, then verify the new current revision again."
+                        },
+                    );
+                }
+
                 call_cache.insert(signature, (0, observation.clone()));
                 self.messages.push(Message::tool(call.id, observation));
             }
@@ -149,18 +317,34 @@ impl Agent {
         )))
     }
 
+    fn can_finish(&self) -> bool {
+        self.workspace_revision == 0 || self.last_verified_revision == Some(self.workspace_revision)
+    }
+
+    fn transition_to(&mut self, phase: AgentPhase) {
+        if self.phase != phase {
+            self.phase = phase;
+            self.emit(AgentEvent::PhaseChanged { phase });
+        }
+    }
+
     fn emit(&self, event: AgentEvent) {
         if let Some(handler) = &self.event_handler {
             handler(event);
             return;
         }
         match event {
-            AgentEvent::Thinking { step } => println!("[step {step}] thinking"),
+            AgentEvent::PhaseChanged { phase } => println!("[phase:{}]", phase.label()),
+            AgentEvent::PlanCreated { plan } => println!("[plan]\n{plan}"),
+            AgentEvent::Thinking { step, phase } => {
+                println!("[{} step {step}] thinking", phase.label())
+            }
             AgentEvent::ToolCall {
                 step,
+                phase,
                 name,
                 arguments,
-            } => println!("[step {step}] {name} {arguments}"),
+            } => println!("[{} step {step}] {name} {arguments}", phase.label()),
             AgentEvent::ToolResult { name, result } => {
                 println!("[tool:{name}] {}", one_line(&result));
             }
@@ -171,19 +355,146 @@ impl Agent {
             } => println!(
                 "[context] compressed {covered_messages} messages: {before_tokens} -> {after_tokens} estimated tokens"
             ),
+            AgentEvent::WorkspaceChanged {
+                revision,
+                tool_name,
+            } => println!("[revision] {revision} after {tool_name}"),
+            AgentEvent::VerificationFinished {
+                revision,
+                command,
+                passed,
+            } => println!(
+                "[verify:{}] revision {revision} · {command}",
+                if passed { "PASS" } else { "FAIL" }
+            ),
+            AgentEvent::FinishBlocked {
+                workspace_revision,
+                last_verified_revision,
+            } => println!(
+                "[verify:BLOCKED] workspace revision {workspace_revision}, last verified {}",
+                last_verified_revision.map_or_else(|| "none".to_owned(), |value| value.to_string())
+            ),
         }
     }
 }
 
-fn invalidates_cached_observations(tool_name: &str, observation: &str) -> bool {
+fn successful_workspace_mutation(tool_name: &str, observation: &str) -> bool {
     matches!(tool_name, "write_file" | "replace_text") && !observation.starts_with("ERROR:")
+}
+
+fn is_workspace_mutation(tool_name: &str) -> bool {
+    matches!(tool_name, "write_file" | "replace_text")
+}
+
+fn planning_tool_definitions(
+    definitions: &[crate::llm::ToolDefinition],
+) -> Vec<crate::llm::ToolDefinition> {
+    definitions
+        .iter()
+        .filter(|definition| is_planning_tool(&definition.function.name))
+        .cloned()
+        .collect()
+}
+
+fn is_planning_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "read_file" | "list_files" | "search_text")
+}
+
+fn command_argument(tool_name: &str, arguments: &str) -> Option<String> {
+    if tool_name != "run_command" {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()?
+        .get("command")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn is_verification_command(command: &str) -> bool {
+    let normalized = command.trim().to_ascii_lowercase();
+    const PREFIXES: &[&str] = &[
+        "cargo test",
+        "cargo check",
+        "cargo clippy",
+        "cargo build",
+        "cargo run",
+        "python -m unittest",
+        "python -m pytest",
+        "python -m compileall",
+        "python -m py_compile",
+        "pytest",
+        "npm test",
+        "npm run test",
+        "npm run build",
+        "npm run lint",
+        "pnpm test",
+        "pnpm run test",
+        "pnpm run build",
+        "pnpm run lint",
+        "yarn test",
+        "yarn build",
+        "yarn lint",
+        "go test",
+        "go build",
+        "go run",
+        "dotnet test",
+        "dotnet build",
+        "mvn test",
+        "mvn verify",
+        "gradle test",
+        "gradlew test",
+        ".\\gradlew test",
+        "./gradlew test",
+    ];
+    PREFIXES.iter().any(|prefix| {
+        normalized == *prefix
+            || normalized
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    }) || is_python_script_command(&normalized)
+}
+
+fn is_python_script_command(command: &str) -> bool {
+    let mut parts = command.split_whitespace();
+    matches!(parts.next(), Some("python" | "python3" | "py"))
+        && parts
+            .next()
+            .is_some_and(|argument| argument.trim_matches(['\'', '"']).ends_with(".py"))
+}
+
+fn command_succeeded(observation: &str) -> bool {
+    observation
+        .lines()
+        .next()
+        .is_some_and(|line| line.trim() == "exit_code: 0")
+}
+
+fn append_runtime_note(observation: &mut String, note: &str) {
+    observation.push_str("\n\nRUNTIME: ");
+    observation.push_str(note);
+}
+
+fn planning_prompt() -> &'static str {
+    "PLAN phase. Understand the task before changing anything. You may inspect the workspace only with read_file, list_files, and search_text. Do not run commands or modify files. When you have enough evidence, return a concise numbered plan with the intended change and verification strategy, without tool calls. This response is a plan, not the final answer."
+}
+
+fn execution_prompt() -> &'static str {
+    "The plan is recorded. Enter EXECUTE: inspect as needed, make the smallest correct changes, and use file tools rather than shell commands for edits. After any successful write_file or replace_text, the runtime advances workspace_revision and blocks DONE until a recognized test, build, lint, or program command exits with code 0 for that same revision."
+}
+
+fn finish_blocked_prompt(workspace_revision: u64, last_verified_revision: Option<u64>) -> String {
+    format!(
+        "Runtime invariant blocked DONE: workspace revision {workspace_revision} is not verified (last verified revision: {}). Enter VERIFY now and call run_command with an appropriate real test, build, lint, or program command. A textual claim is not verification; the command must exit with code 0.",
+        last_verified_revision.map_or_else(|| "none".to_owned(), |value| value.to_string())
+    )
 }
 
 fn system_prompt(workspace: &Path) -> String {
     format!(
         "You are a careful coding agent working only inside this workspace: {}\n\
          Every requested file must remain inside that workspace. If the user asks for a path outside it, explain that they must restart the agent with that path as --workspace; never bypass the file sandbox through shell commands. \
-         Inspect relevant files before editing. Always use write_file to create files and replace_text for small edits; never use run_command, shell redirection, or PowerShell file commands to create or edit files. Use run_command only to build, test, or run the resulting project, and do not repeat a command after it has already returned a successful result. Tool errors \
+         Follow the runtime-controlled PLAN -> EXECUTE -> VERIFY phases. Inspect relevant files before editing. Always use write_file to create files and replace_text for small edits; never use run_command, shell redirection, or PowerShell file commands to create or edit files. Use run_command only to build, test, lint, or run the resulting project. A command result may be reused while the workspace is unchanged, but the same verification command must run again after a successful file edit. Tool errors \
          are observations: correct the request instead of pretending it succeeded. Never request \
          secrets or bypass the sandbox and command policy. When the task is complete, respond with \
          a concise summary of changes and verification performed.",
@@ -287,6 +598,7 @@ mod tests {
     struct NamedCountingTool {
         name: &'static str,
         executions: Arc<AtomicUsize>,
+        output: &'static str,
     }
 
     #[async_trait]
@@ -305,7 +617,7 @@ mod tests {
 
         async fn execute(&self, _arguments: Value) -> Result<String> {
             self.executions.fetch_add(1, Ordering::SeqCst);
-            Ok("ok".to_owned())
+            Ok(self.output.to_owned())
         }
     }
 
@@ -334,7 +646,11 @@ mod tests {
     async fn executes_tool_then_returns_text() {
         let tool_call = echo_call("call-1");
         let model = Arc::new(MockModel {
-            responses: Mutex::new(VecDeque::from([tool_call, Message::assistant("done")])),
+            responses: Mutex::new(VecDeque::from([
+                Message::assistant("1. Inspect and echo."),
+                tool_call,
+                Message::assistant("done"),
+            ])),
         });
         let mut registry = ToolRegistry::new();
         registry.register(EchoTool).expect("register");
@@ -356,6 +672,7 @@ mod tests {
     async fn identical_tool_call_is_executed_only_once() {
         let model = Arc::new(MockModel {
             responses: Mutex::new(VecDeque::from([
+                Message::assistant("1. Inspect and echo."),
                 echo_call("call-1"),
                 echo_call("call-2"),
                 Message::assistant("done"),
@@ -380,6 +697,7 @@ mod tests {
         let command_arguments = r#"{"command":"python -m unittest"}"#;
         let model = Arc::new(MockModel {
             responses: Mutex::new(VecDeque::from([
+                Message::assistant("1. Reproduce, edit, and verify."),
                 tool_call("call-1", "run_command", command_arguments),
                 tool_call(
                     "call-2",
@@ -397,12 +715,14 @@ mod tests {
             .register(NamedCountingTool {
                 name: "run_command",
                 executions: Arc::clone(&command_executions),
+                output: "exit_code: 0\nstdout:\nok\nstderr:\n(empty)",
             })
             .expect("register command");
         registry
             .register(NamedCountingTool {
                 name: "replace_text",
                 executions: Arc::clone(&edit_executions),
+                output: "replaced 1 occurrence",
             })
             .expect("register edit");
         let workspace = tempdir().expect("workspace");
@@ -413,5 +733,175 @@ mod tests {
         assert_eq!(result, "done");
         assert_eq!(edit_executions.load(Ordering::SeqCst), 1);
         assert_eq!(command_executions.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn planning_phase_rejects_mutating_tools() {
+        let model = Arc::new(MockModel {
+            responses: Mutex::new(VecDeque::from([
+                tool_call(
+                    "call-1",
+                    "replace_text",
+                    r#"{"path":"app.py","old_text":"bad","new_text":"good"}"#,
+                ),
+                Message::assistant("1. Inspect before editing."),
+                Message::assistant("No change needed."),
+            ])),
+        });
+        let edit_executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(NamedCountingTool {
+                name: "replace_text",
+                executions: Arc::clone(&edit_executions),
+                output: "replaced 1 occurrence",
+            })
+            .expect("register edit");
+        let workspace = tempdir().expect("workspace");
+        let mut agent = Agent::new(model, registry, workspace.path(), 5, 128_000);
+
+        let result = agent.run_turn("inspect").await.expect("agent run");
+
+        assert_eq!(result, "No change needed.");
+        assert_eq!(edit_executions.load(Ordering::SeqCst), 0);
+        assert_eq!(agent.workspace_revision(), 0);
+        assert_eq!(agent.phase(), super::AgentPhase::Done);
+        assert!(agent.messages().iter().any(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("not allowed during PLAN"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn unverified_edit_blocks_finish_until_command_passes() {
+        let model = Arc::new(MockModel {
+            responses: Mutex::new(VecDeque::from([
+                Message::assistant("1. Edit, then test."),
+                tool_call(
+                    "call-1",
+                    "replace_text",
+                    r#"{"path":"app.py","old_text":"bad","new_text":"good"}"#,
+                ),
+                Message::assistant("premature completion"),
+                tool_call(
+                    "call-2",
+                    "run_command",
+                    r#"{"command":"python -m unittest"}"#,
+                ),
+                Message::assistant("verified completion"),
+            ])),
+        });
+        let edit_executions = Arc::new(AtomicUsize::new(0));
+        let command_executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(NamedCountingTool {
+                name: "replace_text",
+                executions: Arc::clone(&edit_executions),
+                output: "replaced 1 occurrence",
+            })
+            .expect("register edit");
+        registry
+            .register(NamedCountingTool {
+                name: "run_command",
+                executions: Arc::clone(&command_executions),
+                output: "exit_code: 0\nstdout:\nOK\nstderr:\n(empty)",
+            })
+            .expect("register command");
+        let workspace = tempdir().expect("workspace");
+        let mut agent = Agent::new(model, registry, workspace.path(), 7, 128_000);
+
+        let result = agent.run_turn("fix it").await.expect("agent run");
+
+        assert_eq!(result, "verified completion");
+        assert_eq!(edit_executions.load(Ordering::SeqCst), 1);
+        assert_eq!(command_executions.load(Ordering::SeqCst), 1);
+        assert_eq!(agent.workspace_revision(), 1);
+        assert_eq!(agent.last_verified_revision(), Some(1));
+        assert_eq!(agent.phase(), super::AgentPhase::Done);
+        assert!(agent.messages().iter().any(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("Runtime invariant blocked DONE"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn edit_after_a_passed_check_requires_verifying_the_new_revision() {
+        let model = Arc::new(MockModel {
+            responses: Mutex::new(VecDeque::from([
+                Message::assistant("1. Edit, test, refine, and retest."),
+                tool_call(
+                    "call-1",
+                    "replace_text",
+                    r#"{"path":"app.py","old_text":"bad","new_text":"better"}"#,
+                ),
+                tool_call(
+                    "call-2",
+                    "run_command",
+                    r#"{"command":"python -m unittest"}"#,
+                ),
+                tool_call(
+                    "call-3",
+                    "replace_text",
+                    r#"{"path":"app.py","old_text":"better","new_text":"good"}"#,
+                ),
+                Message::assistant("premature completion for revision 2"),
+                tool_call(
+                    "call-4",
+                    "run_command",
+                    r#"{"command":"python -m unittest"}"#,
+                ),
+                Message::assistant("revision 2 verified"),
+            ])),
+        });
+        let edit_executions = Arc::new(AtomicUsize::new(0));
+        let command_executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(NamedCountingTool {
+                name: "replace_text",
+                executions: Arc::clone(&edit_executions),
+                output: "replaced 1 occurrence",
+            })
+            .expect("register edit");
+        registry
+            .register(NamedCountingTool {
+                name: "run_command",
+                executions: Arc::clone(&command_executions),
+                output: "exit_code: 0\nstdout:\nOK\nstderr:\n(empty)",
+            })
+            .expect("register command");
+        let workspace = tempdir().expect("workspace");
+        let mut agent = Agent::new(model, registry, workspace.path(), 9, 128_000);
+
+        let result = agent.run_turn("fix it reliably").await.expect("agent run");
+
+        assert_eq!(result, "revision 2 verified");
+        assert_eq!(edit_executions.load(Ordering::SeqCst), 2);
+        assert_eq!(command_executions.load(Ordering::SeqCst), 2);
+        assert_eq!(agent.workspace_revision(), 2);
+        assert_eq!(agent.last_verified_revision(), Some(2));
+        assert_eq!(agent.phase(), super::AgentPhase::Done);
+    }
+
+    #[test]
+    fn recognizes_real_verification_commands_but_not_arbitrary_successes() {
+        for command in [
+            "cargo test --all",
+            "python -m unittest discover -s tests -v",
+            "pytest -q",
+            "npm run lint",
+            "python hello.py",
+            ".\\gradlew test",
+        ] {
+            assert!(super::is_verification_command(command), "{command}");
+        }
+        for command in ["echo ok", "python --version", "git status", "dir"] {
+            assert!(!super::is_verification_command(command), "{command}");
+        }
     }
 }

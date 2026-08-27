@@ -50,6 +50,15 @@ TUI 快捷键：
 - [x] 使用真实 DeepSeek 模型完成文件读取、命令运行与结果确认冒烟任务
 - [x] 建立可重置的 checkout 故障工程，验证修复前失败、预期最小修复后 5 项测试全部通过
 - [x] 使用真实模型完成可复现 bug 的定位、一行最小修复和 5/5 测试验证
+- [x] 实现运行时约束的 `PLAN → EXECUTE → VERIFY → DONE` 状态机
+
+## Plan → Execute → Verify
+
+- `PLAN` 只暴露 `read_file`、`list_files` 和 `search_text`；模型必须先输出可执行计划。
+- 每次成功 `write_file` 或 `replace_text` 都会递增 `workspace_revision`。
+- 只有明确的 test/build/lint/program 命令且真实 `exit_code: 0` 才更新 `last_verified_revision`。
+- 发生过写入时，仅当 `last_verified_revision == workspace_revision` 才允许进入 `DONE`。模型的文本声明不能绕过该约束。
+- TUI 事件栏展示 `PLAN / EXEC / VERIFY / DONE`，Runtime 区域展示当前 revision 及验证状态。
 
 ## 已实现的终止与错误路径
 

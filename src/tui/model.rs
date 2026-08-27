@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 pub(super) enum MessageRole {
     User,
     Agent,
+    Plan,
     System,
     Error,
 }
@@ -15,6 +16,7 @@ impl MessageRole {
         match self {
             Self::User => "USER",
             Self::Agent => "AGENT",
+            Self::Plan => "PLAN",
             Self::System => "SYSTEM",
             Self::Error => "ERROR",
         }
@@ -24,6 +26,7 @@ impl MessageRole {
         match self {
             Self::User => Style::default().fg(Color::Black).bg(Color::LightGreen),
             Self::Agent => Style::default().fg(Color::Black).bg(Color::LightBlue),
+            Self::Plan => Style::default().fg(Color::Black).bg(Color::LightYellow),
             Self::System => Style::default().fg(Color::Black).bg(Color::Gray),
             Self::Error => Style::default().fg(Color::White).bg(Color::Red),
         }
@@ -83,8 +86,11 @@ impl ChatMessage {
 
 #[derive(Clone, Copy)]
 pub(super) enum EventKind {
+    Plan,
+    Execute,
+    Verify,
+    Done,
     State,
-    Tool,
     Result,
     Context,
     Info,
@@ -94,8 +100,11 @@ pub(super) enum EventKind {
 impl EventKind {
     fn label(self) -> &'static str {
         match self {
+            Self::Plan => "PLAN",
+            Self::Execute => "EXEC",
+            Self::Verify => "VERIFY",
+            Self::Done => "DONE",
             Self::State => "STATE",
-            Self::Tool => "TOOL",
             Self::Result => "RESULT",
             Self::Context => "CTX",
             Self::Info => "INFO",
@@ -105,8 +114,11 @@ impl EventKind {
 
     fn style(self) -> Style {
         match self {
+            Self::Plan => Style::default().fg(Color::Black).bg(Color::LightYellow),
+            Self::Execute => Style::default().fg(Color::Black).bg(Color::LightBlue),
+            Self::Verify => Style::default().fg(Color::Black).bg(Color::LightMagenta),
+            Self::Done => Style::default().fg(Color::Black).bg(Color::LightGreen),
             Self::State => Style::default().fg(Color::Black).bg(Color::Magenta),
-            Self::Tool => Style::default().fg(Color::Black).bg(Color::Blue),
             Self::Result => Style::default().fg(Color::Black).bg(Color::Gray),
             Self::Context => Style::default().fg(Color::Black).bg(Color::Cyan),
             Self::Info => Style::default().fg(Color::Black).bg(Color::LightCyan),

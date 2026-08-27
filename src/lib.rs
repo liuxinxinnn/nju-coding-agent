@@ -7,7 +7,7 @@ pub mod tool;
 pub mod tools;
 pub mod tui;
 
-pub use agent::Agent;
+pub use agent::{Agent, AgentPhase};
 pub use config::Config;
 pub use error::{Error, Result};
 pub use llm::HttpLanguageModel;

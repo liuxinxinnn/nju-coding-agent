@@ -46,8 +46,24 @@ finally {
 $timer.Stop()
 
 $trace = Get-Content -LiteralPath $logPath -ErrorAction SilentlyContinue
-$stepCount = @($trace | Select-String -Pattern '^\[step \d+\] thinking').Count
-$toolCallCount = @($trace | Select-String -Pattern '^\[step \d+\] [a-z_]+ ').Count
+$stepCount = @($trace | Select-String -Pattern '^\[(PLAN|EXEC|VERIFY) step \d+\] thinking').Count
+$toolCallCount = @($trace | Select-String -Pattern '^\[(PLAN|EXEC|VERIFY) step \d+\] [a-z_]+ ').Count
+$phaseSequence = @(
+    $trace | Select-String -Pattern '^\[phase:(PLAN|EXEC|VERIFY|DONE)\]$' | ForEach-Object {
+        $_.Matches[0].Groups[1].Value
+    }
+) -join ' -> '
+$revisionMatches = @($trace | Select-String -Pattern '^\[revision\] (\d+) ')
+$workspaceRevision = if ($revisionMatches.Count -eq 0) {
+    0
+}
+else {
+    [int]$revisionMatches[-1].Matches[0].Groups[1].Value
+}
+$doneReached = @($trace | Select-String -Pattern '^\[phase:DONE\]$').Count -gt 0
+$currentRevisionVerified = $workspaceRevision -eq 0 -or @(
+    $trace | Select-String -Pattern "^\[verify:PASS\] revision $workspaceRevision "
+).Count -gt 0
 $testsUnchanged = (Get-FileHash -LiteralPath $fixtureTest -Algorithm SHA256).Hash -eq
     (Get-FileHash -LiteralPath $workspaceTest -Algorithm SHA256).Hash
 
@@ -64,10 +80,20 @@ Write-Output "Agent exit code: $agentExitCode"
 Write-Output "Test exit code: $testExitCode"
 Write-Output "Agent steps: $stepCount"
 Write-Output "Tool calls: $toolCallCount"
+Write-Output "Phase sequence: $phaseSequence"
+Write-Output "Workspace revision: $workspaceRevision"
+Write-Output "Current revision verified: $currentRevisionVerified"
+Write-Output "DONE reached: $doneReached"
 Write-Output ("Elapsed seconds: {0:N2}" -f $timer.Elapsed.TotalSeconds)
 Write-Output "Tests unchanged: $testsUnchanged"
 Write-Output "Agent trace: $logPath"
 
-if ($agentExitCode -ne 0 -or $testExitCode -ne 0 -or -not $testsUnchanged) {
+if (
+    $agentExitCode -ne 0 -or
+    $testExitCode -ne 0 -or
+    -not $testsUnchanged -or
+    -not $doneReached -or
+    -not $currentRevisionVerified
+) {
     exit 1
 }

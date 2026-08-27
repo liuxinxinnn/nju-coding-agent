@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
-use crate::agent::AgentEvent;
+use crate::agent::{AgentEvent, AgentPhase};
 use crate::tools::{ApprovalFn, default_registry_with_approval};
 use crate::{Agent, Config, HttpLanguageModel, Result};
 
@@ -66,6 +66,9 @@ struct App {
     tools: Vec<String>,
     busy: bool,
     status: String,
+    phase: AgentPhase,
+    workspace_revision: u64,
+    last_verified_revision: Option<u64>,
     should_quit: bool,
     show_help: bool,
     events_collapsed: bool,
@@ -90,6 +93,9 @@ impl App {
             tools: Vec::new(),
             busy: false,
             status: "初始化".to_owned(),
+            phase: AgentPhase::Done,
+            workspace_revision: 0,
+            last_verified_revision: None,
             should_quit: false,
             show_help: false,
             events_collapsed: false,
@@ -127,18 +133,36 @@ impl App {
                 self.status = "执行中".to_owned();
             }
             WorkerEvent::Agent(event) => match event {
-                AgentEvent::Thinking { step } => {
-                    self.status = format!("思考中 · step {step}");
-                    self.push_event(EventKind::State, format!("第 {step} 步：模型思考"));
+                AgentEvent::PhaseChanged { phase } => {
+                    self.phase = phase;
+                    self.status = phase_status(phase).to_owned();
+                    self.push_event(
+                        phase_event_kind(phase),
+                        format!("进入 {} 阶段", phase.label()),
+                    );
+                }
+                AgentEvent::PlanCreated { plan } => {
+                    self.push_message(MessageRole::Plan, plan.clone());
+                    self.push_event(
+                        EventKind::Plan,
+                        format!("计划 · {}", summarize_result(&plan)),
+                    );
+                }
+                AgentEvent::Thinking { step, phase } => {
+                    self.phase = phase;
+                    self.status = format!("{} · step {step}", phase.label());
+                    self.push_event(phase_event_kind(phase), format!("#{step} 模型思考"));
                 }
                 AgentEvent::ToolCall {
                     step,
+                    phase,
                     name,
                     arguments,
                 } => {
-                    self.status = format!("工具 · {name}");
+                    self.phase = phase;
+                    self.status = format!("{} · {name}", phase.label());
                     self.push_event(
-                        EventKind::Tool,
+                        phase_event_kind(phase),
                         format!("#{step} {name} · {}", summarize_arguments(&arguments)),
                     );
                 }
@@ -158,6 +182,46 @@ impl App {
                         "压缩 {covered_messages} 条消息 · {before_tokens} → {after_tokens} tokens"
                     ),
                 ),
+                AgentEvent::WorkspaceChanged {
+                    revision,
+                    tool_name,
+                } => {
+                    self.workspace_revision = revision;
+                    self.push_event(
+                        EventKind::Execute,
+                        format!("workspace rev {revision} · {tool_name}"),
+                    );
+                }
+                AgentEvent::VerificationFinished {
+                    revision,
+                    command,
+                    passed,
+                } => {
+                    if passed {
+                        self.last_verified_revision = Some(revision);
+                    } else if self.last_verified_revision == Some(revision) {
+                        self.last_verified_revision = None;
+                    }
+                    self.push_event(
+                        EventKind::Verify,
+                        format!(
+                            "{} rev {revision} · {}",
+                            if passed { "PASS" } else { "FAIL" },
+                            summarize_result(&command)
+                        ),
+                    );
+                }
+                AgentEvent::FinishBlocked {
+                    workspace_revision,
+                    last_verified_revision,
+                } => {
+                    self.workspace_revision = workspace_revision;
+                    self.last_verified_revision = last_verified_revision;
+                    self.push_event(
+                        EventKind::Verify,
+                        format!("DONE 被阻止 · rev {workspace_revision} 未验证"),
+                    );
+                }
             },
             WorkerEvent::Done(result) => {
                 self.busy = false;
@@ -224,8 +288,11 @@ impl App {
             "/status" => self.push_message(
                 MessageRole::System,
                 format!(
-                    "状态：{}\n模型：{}\nWorkspace：{}",
+                    "状态：{}\n阶段：{}\n版本：rev {} / {}\n模型：{}\nWorkspace：{}",
                     self.status,
+                    self.phase.label(),
+                    self.workspace_revision,
+                    verification_label(self.workspace_revision, self.last_verified_revision),
                     self.model,
                     self.workspace.display()
                 ),
@@ -465,9 +532,15 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Line::from(vec![
             Span::raw("状态  "),
             Span::styled(&app.status, Style::default().fg(status_color)),
+            Span::raw(format!(" · 工具 {}", app.tools.len())),
         ]),
+        Line::from(format!(
+            "阶段  {} · rev {} {}",
+            app.phase.label(),
+            app.workspace_revision,
+            verification_label(app.workspace_revision, app.last_verified_revision)
+        )),
         Line::from(format!("模型  {}", app.model)),
-        Line::from(format!("工具  {}", app.tools.len())),
     ])
     .block(Block::default().borders(Borders::ALL).title("Runtime"));
     frame.render_widget(runtime, areas.runtime);
@@ -572,4 +645,32 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
 fn display_path(path: &std::path::Path) -> String {
     let display = path.display().to_string();
     display.strip_prefix(r"\\?\").unwrap_or(&display).to_owned()
+}
+
+fn phase_event_kind(phase: AgentPhase) -> EventKind {
+    match phase {
+        AgentPhase::Planning => EventKind::Plan,
+        AgentPhase::Executing => EventKind::Execute,
+        AgentPhase::Verifying => EventKind::Verify,
+        AgentPhase::Done => EventKind::Done,
+    }
+}
+
+fn phase_status(phase: AgentPhase) -> &'static str {
+    match phase {
+        AgentPhase::Planning => "规划中",
+        AgentPhase::Executing => "执行中",
+        AgentPhase::Verifying => "验证中",
+        AgentPhase::Done => "已完成",
+    }
+}
+
+fn verification_label(workspace_revision: u64, last_verified_revision: Option<u64>) -> String {
+    if workspace_revision == 0 {
+        "clean".to_owned()
+    } else if last_verified_revision == Some(workspace_revision) {
+        "✓".to_owned()
+    } else {
+        "未验证".to_owned()
+    }
 }
