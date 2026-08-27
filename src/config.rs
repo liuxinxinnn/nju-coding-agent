@@ -10,6 +10,7 @@ pub struct Config {
     pub model: String,
     pub workspace: PathBuf,
     pub max_steps: usize,
+    pub context_window_tokens: u64,
     pub auto_approve: bool,
 }
 
@@ -19,6 +20,18 @@ impl Config {
         let model = required_env("CODING_AGENT_MODEL")?;
         let base_url = env::var("CODING_AGENT_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_owned());
+        let context_window_tokens = env::var("CODING_AGENT_CONTEXT_WINDOW")
+            .ok()
+            .map(|value| {
+                value.parse::<u64>().map_err(|error| {
+                    Error::Config(format!(
+                        "invalid CODING_AGENT_CONTEXT_WINDOW '{value}': {error}"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(crate::context::DEFAULT_CONTEXT_WINDOW_TOKENS)
+            .max(1);
         let workspace = workspace
             .canonicalize()
             .map_err(|error| Error::Config(format!("invalid workspace: {error}")))?;
@@ -36,6 +49,7 @@ impl Config {
             model,
             workspace,
             max_steps: max_steps.max(1),
+            context_window_tokens,
             auto_approve,
         })
     }

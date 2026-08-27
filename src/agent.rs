@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::context::ContextManager;
 use crate::error::{Error, Result};
 use crate::llm::{LanguageModel, Message};
 use crate::tool::ToolRegistry;
@@ -13,6 +14,7 @@ pub struct Agent {
     tools: ToolRegistry,
     messages: Vec<Message>,
     max_steps: usize,
+    context: ContextManager,
 }
 
 impl Agent {
@@ -21,12 +23,14 @@ impl Agent {
         tools: ToolRegistry,
         workspace: &Path,
         max_steps: usize,
+        context_window_tokens: u64,
     ) -> Self {
         Self {
             model,
             tools,
             messages: vec![Message::system(system_prompt(workspace))],
             max_steps: max_steps.max(1),
+            context: ContextManager::new(context_window_tokens),
         }
     }
 
@@ -43,6 +47,15 @@ impl Agent {
         let mut repeated_calls = BTreeMap::<String, usize>::new();
 
         for step in 1..=self.max_steps {
+            if let Some(event) = self
+                .context
+                .compact_if_needed(&mut self.messages, &definitions)?
+            {
+                eprintln!(
+                    "[context] compressed {} messages: {} -> {} estimated tokens",
+                    event.covered_messages, event.before_tokens, event.after_tokens
+                );
+            }
             let response = self.model.complete(&self.messages, &definitions).await?;
             let tool_calls = response.tool_calls.clone().unwrap_or_default();
             let final_text = response.content.clone().unwrap_or_default();
@@ -186,7 +199,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(EchoTool).expect("register");
         let workspace = tempdir().expect("workspace");
-        let mut agent = Agent::new(model, registry, workspace.path(), 5);
+        let mut agent = Agent::new(model, registry, workspace.path(), 5, 128_000);
 
         let result = agent.run_turn("do it").await.expect("agent run");
 

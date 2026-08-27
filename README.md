@@ -33,7 +33,8 @@ cargo run -- --workspace D:\path\to\project "修复测试失败并运行测试�
 - [x] OpenAI-compatible LLM 客户端
 - [x] Agent 循环与对话历史
 - [x] 文件、搜索、编辑、命令工具
-- [x] 安全边界与自动化测试（8 项测试通过）
+- [x] 安全边界与自动化测试
+- [x] 从 SecAudit 适配上下文预算与本地压缩，保留最近完整用户轮次
 - [ ] 使用真实模型完成创建文件与修复 bug 的冒烟任务
 
 ## 已实现的终止与错误路径
@@ -43,5 +44,6 @@ cargo run -- --workspace D:\path\to\project "修复测试失败并运行测试�
 - 未知工具、坏 JSON 参数、工具失败都会变成 observation 交回模型纠正。
 - 模型既不返回文本也不返回工具调用时明确报错。
 - 工具输出统一截断，避免大文件或命令输出撑爆上下文。
+- 上下文达到配置窗口的 80% 时自动生成本地摘要，并压缩到约 60% 的预算目标。
 
 详细计划见 [PROJECT_PLAN.md](PROJECT_PLAN.md)。

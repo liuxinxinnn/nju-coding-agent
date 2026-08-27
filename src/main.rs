@@ -43,7 +43,13 @@ async fn run() -> Result<()> {
         config.model.clone(),
     )?);
     let tools = default_registry(config.workspace.clone(), config.auto_approve)?;
-    let mut agent = Agent::new(model, tools, &config.workspace, config.max_steps);
+    let mut agent = Agent::new(
+        model,
+        tools,
+        &config.workspace,
+        config.max_steps,
+        config.context_window_tokens,
+    );
 
     if !cli.task.is_empty() {
         let answer = agent.run_turn(&cli.task.join(" ")).await?;
