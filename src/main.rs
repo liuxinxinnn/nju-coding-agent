@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use nju_coding_agent::tools::default_registry;
+use nju_coding_agent::tui;
 use nju_coding_agent::{Agent, Config, HttpLanguageModel, Result};
 
 #[derive(Debug, Parser)]
@@ -22,6 +23,10 @@ struct Cli {
     #[arg(long)]
     yes: bool,
 
+    /// Use the simple line-oriented REPL instead of the full-screen TUI.
+    #[arg(long)]
+    plain: bool,
+
     /// Task to execute. If omitted, starts a multi-turn interactive session.
     task: Vec<String>,
 }
@@ -37,19 +42,12 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::from_env(cli.workspace, cli.max_steps, cli.yes)?;
-    let model = Arc::new(HttpLanguageModel::new(
-        &config.base_url,
-        config.api_key.clone(),
-        config.model.clone(),
-    )?);
-    let tools = default_registry(config.workspace.clone(), config.auto_approve)?;
-    let mut agent = Agent::new(
-        model,
-        tools,
-        &config.workspace,
-        config.max_steps,
-        config.context_window_tokens,
-    );
+
+    if cli.task.is_empty() && !cli.plain {
+        return tui::run(config).await;
+    }
+
+    let mut agent = build_agent(&config)?;
 
     if !cli.task.is_empty() {
         let answer = agent.run_turn(&cli.task.join(" ")).await?;
@@ -57,6 +55,26 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    run_plain_repl(&config, &mut agent).await
+}
+
+fn build_agent(config: &Config) -> Result<Agent> {
+    let model = Arc::new(HttpLanguageModel::new(
+        &config.base_url,
+        config.api_key.clone(),
+        config.model.clone(),
+    )?);
+    let tools = default_registry(config.workspace.clone(), config.auto_approve)?;
+    Ok(Agent::new(
+        model,
+        tools,
+        &config.workspace,
+        config.max_steps,
+        config.context_window_tokens,
+    ))
+}
+
+async fn run_plain_repl(config: &Config, agent: &mut Agent) -> Result<()> {
     println!("Workspace: {}", config.workspace.display());
     println!("Enter a task, or /quit to exit.");
     loop {

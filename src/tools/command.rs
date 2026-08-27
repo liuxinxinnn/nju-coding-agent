@@ -1,5 +1,6 @@
 use std::io::{self, Write as _};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -39,13 +40,25 @@ impl CommandPolicy {
 pub struct RunCommand {
     sandbox: Sandbox,
     auto_approve: bool,
+    approval: ApprovalFn,
 }
 
+pub type ApprovalFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 impl RunCommand {
-    pub const fn new(sandbox: Sandbox, auto_approve: bool) -> Self {
+    pub fn new(sandbox: Sandbox, auto_approve: bool) -> Self {
         Self {
             sandbox,
             auto_approve,
+            approval: Arc::new(|command| confirm(command).unwrap_or(false)),
+        }
+    }
+
+    pub fn with_approval(sandbox: Sandbox, auto_approve: bool, approval: ApprovalFn) -> Self {
+        Self {
+            sandbox,
+            auto_approve,
+            approval,
         }
     }
 }
@@ -81,7 +94,7 @@ impl Tool for RunCommand {
             CommandDecision::Block => {
                 return Err(Error::Tool("command blocked by safety policy".to_owned()));
             }
-            CommandDecision::Confirm if !self.auto_approve && !confirm(command)? => {
+            CommandDecision::Confirm if !self.auto_approve && !(self.approval)(command) => {
                 return Err(Error::Tool("user denied command execution".to_owned()));
             }
             CommandDecision::Allow | CommandDecision::Confirm => {}
@@ -209,7 +222,15 @@ fn is_blocked(command: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandDecision, CommandPolicy};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use crate::tool::Tool;
+
+    use super::{CommandDecision, CommandPolicy, RunCommand, Sandbox};
 
     #[test]
     fn blocks_destructive_commands() {
@@ -234,5 +255,25 @@ mod tests {
             CommandPolicy::evaluate("git status; echo injected"),
             CommandDecision::Confirm
         );
+    }
+
+    #[tokio::test]
+    async fn custom_approval_callback_can_deny_command() {
+        let workspace = tempdir().expect("workspace");
+        let called = Arc::new(AtomicBool::new(false));
+        let callback_state = Arc::clone(&called);
+        let tool = RunCommand::with_approval(
+            Sandbox::new(workspace.path().to_path_buf()).expect("sandbox"),
+            false,
+            Arc::new(move |_command| {
+                callback_state.store(true, Ordering::SeqCst);
+                false
+            }),
+        );
+
+        let result = tool.execute(json!({"command": "echo hello"})).await;
+
+        assert!(called.load(Ordering::SeqCst));
+        assert!(result.is_err());
     }
 }

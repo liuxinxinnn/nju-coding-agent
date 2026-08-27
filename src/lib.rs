@@ -5,6 +5,7 @@ pub mod error;
 pub mod llm;
 pub mod tool;
 pub mod tools;
+pub mod tui;
 
 pub use agent::Agent;
 pub use config::Config;

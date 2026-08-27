@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use crate::error::Result;
 use crate::tool::ToolRegistry;
 
-pub use command::{CommandDecision, CommandPolicy};
+pub use command::{ApprovalFn, CommandDecision, CommandPolicy};
 pub use sandbox::Sandbox;
 
 pub fn default_registry(workspace: PathBuf, auto_approve: bool) -> Result<ToolRegistry> {
@@ -19,6 +19,26 @@ pub fn default_registry(workspace: PathBuf, auto_approve: bool) -> Result<ToolRe
     registry.register(files::WriteFile::new(sandbox.clone()))?;
     registry.register(files::ReplaceText::new(sandbox.clone()))?;
     registry.register(command::RunCommand::new(sandbox, auto_approve))?;
+    Ok(registry)
+}
+
+pub fn default_registry_with_approval(
+    workspace: PathBuf,
+    auto_approve: bool,
+    approval: ApprovalFn,
+) -> Result<ToolRegistry> {
+    let sandbox = Sandbox::new(workspace)?;
+    let mut registry = ToolRegistry::new();
+    registry.register(files::ReadFile::new(sandbox.clone()))?;
+    registry.register(files::ListFiles::new(sandbox.clone()))?;
+    registry.register(files::SearchText::new(sandbox.clone()))?;
+    registry.register(files::WriteFile::new(sandbox.clone()))?;
+    registry.register(files::ReplaceText::new(sandbox.clone()))?;
+    registry.register(command::RunCommand::with_approval(
+        sandbox,
+        auto_approve,
+        approval,
+    ))?;
     Ok(registry)
 }
 

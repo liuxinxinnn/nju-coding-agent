@@ -9,12 +9,36 @@ use crate::tool::ToolRegistry;
 
 const MAX_IDENTICAL_CALLS: usize = 3;
 
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    Thinking {
+        step: usize,
+    },
+    ToolCall {
+        step: usize,
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        name: String,
+        result: String,
+    },
+    ContextCompressed {
+        covered_messages: usize,
+        before_tokens: u64,
+        after_tokens: u64,
+    },
+}
+
+type EventHandler = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+
 pub struct Agent {
     model: Arc<dyn LanguageModel>,
     tools: ToolRegistry,
     messages: Vec<Message>,
     max_steps: usize,
     context: ContextManager,
+    event_handler: Option<EventHandler>,
 }
 
 impl Agent {
@@ -31,7 +55,15 @@ impl Agent {
             messages: vec![Message::system(system_prompt(workspace))],
             max_steps: max_steps.max(1),
             context: ContextManager::new(context_window_tokens),
+            event_handler: None,
         }
+    }
+
+    pub fn on_event<F>(&mut self, handler: F)
+    where
+        F: Fn(AgentEvent) + Send + Sync + 'static,
+    {
+        self.event_handler = Some(Arc::new(handler));
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -47,14 +79,16 @@ impl Agent {
         let mut repeated_calls = BTreeMap::<String, usize>::new();
 
         for step in 1..=self.max_steps {
+            self.emit(AgentEvent::Thinking { step });
             if let Some(event) = self
                 .context
                 .compact_if_needed(&mut self.messages, &definitions)?
             {
-                eprintln!(
-                    "[context] compressed {} messages: {} -> {} estimated tokens",
-                    event.covered_messages, event.before_tokens, event.after_tokens
-                );
+                self.emit(AgentEvent::ContextCompressed {
+                    covered_messages: event.covered_messages,
+                    before_tokens: event.before_tokens,
+                    after_tokens: event.after_tokens,
+                });
             }
             let response = self.model.complete(&self.messages, &definitions).await?;
             let tool_calls = response.tool_calls.clone().unwrap_or_default();
@@ -81,15 +115,19 @@ impl Agent {
                     )));
                 }
 
-                eprintln!(
-                    "[step {step}] {} {}",
-                    call.function.name, call.function.arguments
-                );
+                self.emit(AgentEvent::ToolCall {
+                    step,
+                    name: call.function.name.clone(),
+                    arguments: call.function.arguments.clone(),
+                });
                 let observation = self
                     .tools
                     .execute(&call.function.name, &call.function.arguments)
                     .await;
-                eprintln!("[tool] {}", one_line(&observation));
+                self.emit(AgentEvent::ToolResult {
+                    name: call.function.name,
+                    result: observation.clone(),
+                });
                 self.messages.push(Message::tool(call.id, observation));
             }
         }
@@ -98,6 +136,31 @@ impl Agent {
             "maximum step limit ({}) reached",
             self.max_steps
         )))
+    }
+
+    fn emit(&self, event: AgentEvent) {
+        if let Some(handler) = &self.event_handler {
+            handler(event);
+            return;
+        }
+        match event {
+            AgentEvent::Thinking { step } => eprintln!("[step {step}] thinking"),
+            AgentEvent::ToolCall {
+                step,
+                name,
+                arguments,
+            } => eprintln!("[step {step}] {name} {arguments}"),
+            AgentEvent::ToolResult { name, result } => {
+                eprintln!("[tool:{name}] {}", one_line(&result));
+            }
+            AgentEvent::ContextCompressed {
+                covered_messages,
+                before_tokens,
+                after_tokens,
+            } => eprintln!(
+                "[context] compressed {covered_messages} messages: {before_tokens} -> {after_tokens} estimated tokens"
+            ),
+        }
     }
 }
 
