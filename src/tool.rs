@@ -49,7 +49,15 @@ impl ToolRegistry {
 
     pub async fn execute(&self, name: &str, raw_arguments: &str) -> String {
         let Some(tool) = self.tools.get(name) else {
-            return format!("ERROR: unknown tool '{name}'");
+            let available = self.tools.keys().cloned().collect::<Vec<_>>().join(", ");
+            return format!(
+                "ERROR: unknown tool '{name}'. Available tools: {}",
+                if available.is_empty() {
+                    "(none)"
+                } else {
+                    &available
+                }
+            );
         };
 
         let arguments = match serde_json::from_str::<Value>(raw_arguments) {

@@ -6,7 +6,7 @@
 
 - 自己管理对话历史、模型响应解析、工具执行和循环终止。
 - 通过 OpenAI-compatible Chat Completions API 使用模型原生 tool calling。
-- 只在指定工作目录内读写文件，并对命令执行施加确定性的安全策略。
+- 文件工具只在指定工作目录内读写，并对命令执行施加确定性的安全策略。
 - 保持实现小而清晰，使每个关键设计都能在面试中解释和辩护。
 
 ## 运行
@@ -25,7 +25,9 @@ $env:DEEPSEEK_API_KEY = "新生成的密钥"
 cargo run -- --workspace D:\path\to\project "修复测试失败并运行测试验证"
 ```
 
-`--workspace` 是文件与命令的硬边界。如果任务需要写入 `D:\NJU-Agent\test`，启动时就应把该目录设为 workspace，不要在任务文本中要求写到当前 workspace 之外。
+`--workspace` 是文件工具的强制边界。如果任务需要写入 `D:\NJU-Agent\test`，启动时就应把该目录设为 workspace，不要在任务文本中要求写到当前 workspace 之外。
+
+`run_command` 固定以 workspace 为工作目录，并拦截父目录路径、显式 workspace 外绝对路径和已知危险命令，普通执行命令还需用户确认。但它不是容器或 OS 级沙箱：被执行的解释器或程序理论上仍可能自行访问其他路径。因此这里把命令机制描述为“策略限制与人工确认”，不宣称完全隔离。
 
 不传任务文本时默认进入全屏 TUI。高风险或未知命令会在界面中弹出确认框；演示环境可显式传入 `--yes`。需要简单逐行模式时使用 `--plain`。
 
@@ -56,6 +58,7 @@ TUI 快捷键：
 - [x] 确定性检测 Rust、Python、Node.js、Maven、Gradle、Go 和 .NET 项目并选择验证命令
 - [x] 本地持久化多轮会话，支持新建、列表、切换和删除
 - [x] 流式聚合文本、`reasoning_content` 与 tool call 参数，并在 TUI 中增量显示
+- [x] 补齐模型响应与工具错误矩阵、严格编辑语义、revision-aware 去重、符号链接逃逸和上下文工具调用原子性测试
 
 ## Plan → Execute → Verify
 
@@ -91,7 +94,7 @@ Windows 默认保存到 `%LOCALAPPDATA%\nju-coding-agent\sessions`；也可通�
 ## 已实现的终止与错误路径
 
 - 每轮最多执行指定步数，避免模型无限循环。
-- 工作区状态未变时，相同工具参数只实际执行一次；成功写入或编辑文件后会废弃旧的读取与测试结果，允许重新验证。
+- 去重键包含工具名、参数和 `workspace_revision`；同一 revision 中相同调用只实际执行一次，文件修改后相同读取或测试会在新 revision 重新执行。
 - 未知工具、坏 JSON 参数、工具失败都会变成 observation 交回模型纠正。
 - 模型既不返回文本也不返回工具调用时明确报错。
 - 工具输出统一截断，避免大文件或命令输出撑爆上下文。

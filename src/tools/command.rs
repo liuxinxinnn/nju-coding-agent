@@ -427,5 +427,12 @@ mod tests {
             )
             .is_ok()
         );
+        assert!(
+            ensure_command_paths_inside_workspace(
+                r#"python -c "open('C:/Users/example/secret.txt').read()""#,
+                workspace,
+            )
+            .is_err()
+        );
     }
 }

@@ -179,4 +179,61 @@ mod tests {
         assert!(sandbox.resolve_writable(".env").is_err());
         assert!(sandbox.resolve_writable("config/.env.local").is_err());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_that_resolves_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        assert_outside_directory_symlink_is_rejected(|target, link| symlink(target, link))
+            .expect("create symlink");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_symlink_that_resolves_outside_workspace() {
+        use std::os::windows::fs::symlink_dir;
+        use std::process::Command;
+
+        let result =
+            assert_outside_directory_symlink_is_rejected(|target, link| symlink_dir(target, link));
+        if let Err(error) = result {
+            // Creating symlinks requires Developer Mode or elevated privileges on some Windows
+            // hosts. Directory junctions exercise the same reparse-point escape without that
+            // privilege, so the boundary is still actually tested on Windows.
+            assert_eq!(error.raw_os_error(), Some(1314), "{error}");
+            assert_outside_directory_symlink_is_rejected(|target, link| {
+                let output = Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(link)
+                    .arg(target)
+                    .output()?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(
+                        String::from_utf8_lossy(&output.stderr).into_owned(),
+                    ))
+                }
+            })
+            .expect("create directory junction");
+        }
+    }
+
+    fn assert_outside_directory_symlink_is_rejected(
+        create_link: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let parent = tempdir().expect("temp dir");
+        let root = parent.path().join("workspace");
+        let outside = parent.path().join("outside");
+        fs::create_dir(&root).expect("workspace");
+        fs::create_dir(&outside).expect("outside");
+        fs::write(outside.join("secret.txt"), "secret").expect("fixture");
+        create_link(&outside, &root.join("escape"))?;
+        let sandbox = Sandbox::new(root).expect("sandbox");
+
+        assert!(sandbox.resolve_existing("escape/secret.txt").is_err());
+        assert!(sandbox.resolve_writable("escape/new.txt").is_err());
+        Ok(())
+    }
 }

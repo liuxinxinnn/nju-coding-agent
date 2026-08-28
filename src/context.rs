@@ -256,7 +256,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::ContextManager;
-    use crate::llm::{Message, Role};
+    use crate::llm::{FunctionCall, Message, Role, ToolCall};
 
     #[test]
     fn estimates_chinese_more_conservatively_than_ascii() {
@@ -294,5 +294,49 @@ mod tests {
                     .as_deref()
                     .is_some_and(|content| content.contains("Progress summary"))
         }));
+    }
+
+    #[test]
+    fn compaction_keeps_tool_call_and_result_as_one_recent_turn() {
+        let manager = ContextManager::with_policy(350, 40, 25);
+        let mut messages = vec![
+            Message::system("system"),
+            Message::user("old request ".repeat(80)),
+            Message::assistant("old answer ".repeat(80)),
+            Message::user("latest request"),
+            Message {
+                role: Role::Assistant,
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call-latest".to_owned(),
+                    kind: "function".to_owned(),
+                    function: FunctionCall {
+                        name: "read_file".to_owned(),
+                        arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            Message::tool("call-latest", "current file contents"),
+            Message::assistant("latest conclusion"),
+        ];
+
+        manager
+            .compact_if_needed(&mut messages, &[])
+            .expect("compression")
+            .expect("event");
+
+        let retained_call = messages.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == "call-latest"))
+        });
+        let retained_result = messages.iter().any(|message| {
+            message.role == Role::Tool && message.tool_call_id.as_deref() == Some("call-latest")
+        });
+        assert!(retained_call && retained_result);
+        assert_eq!(messages[2].role, Role::User);
     }
 }

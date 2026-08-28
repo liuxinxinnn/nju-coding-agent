@@ -261,4 +261,45 @@ mod tests {
         assert_eq!(call.function.name, "read_file");
         assert_eq!(call.function.arguments, r#"{"path":"a.py"}"#);
     }
+
+    #[test]
+    fn aggregates_multiple_tool_calls_by_index() {
+        let mut accumulator = StreamAccumulator::default();
+        accumulator
+            .ingest_json(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call-2","type":"function","function":{"name":"list_files","arguments":"{}"}},{"index":0,"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.py\"}"}}]}}]}"#,
+            )
+            .expect("tool delta");
+
+        let calls = accumulator
+            .finish()
+            .expect("message")
+            .tool_calls
+            .expect("calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call-1");
+        assert_eq!(calls[1].id, "call-2");
+    }
+
+    #[test]
+    fn rejects_empty_choices_api_errors_and_incomplete_tool_calls() {
+        let mut empty = StreamAccumulator::default();
+        assert!(empty.ingest_json(r#"{"choices":[]}"#).is_ok());
+        assert!(empty.finish().is_err());
+
+        let mut api_error = StreamAccumulator::default();
+        assert!(
+            api_error
+                .ingest_json(r#"{"choices":[],"error":{"message":"bad request"}}"#)
+                .is_err()
+        );
+
+        let mut incomplete = StreamAccumulator::default();
+        incomplete
+            .ingest_json(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#,
+            )
+            .expect("delta");
+        assert!(incomplete.finish().is_err());
+    }
 }

@@ -243,14 +243,7 @@ impl LanguageModel for HttpLanguageModel {
             return Err(Error::Llm(format!("HTTP {status}: {message}")));
         }
 
-        let mut payload: ChatResponse = serde_json::from_str(&body)
-            .map_err(|error| Error::Llm(format!("invalid response JSON: {error}")))?;
-        payload
-            .choices
-            .drain(..)
-            .next()
-            .map(|choice| choice.message)
-            .ok_or_else(|| Error::Llm("response contained no choices".to_owned()))
+        parse_chat_response(&body)
     }
 
     async fn complete_stream(
@@ -390,6 +383,17 @@ impl LanguageModel for HttpLanguageModel {
     }
 }
 
+fn parse_chat_response(body: &str) -> Result<Message> {
+    let mut payload: ChatResponse = serde_json::from_str(body)
+        .map_err(|error| Error::Llm(format!("invalid response JSON: {error}")))?;
+    payload
+        .choices
+        .drain(..)
+        .next()
+        .map(|choice| choice.message)
+        .ok_or_else(|| Error::Llm("response contained no choices".to_owned()))
+}
+
 fn chat_completions_endpoint(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     if base.ends_with("/chat/completions") {
@@ -412,6 +416,7 @@ mod tests {
 
     use super::{
         DeltaHandler, HttpLanguageModel, LanguageModel, Message, chat_completions_endpoint,
+        parse_chat_response,
     };
 
     #[test]
@@ -424,6 +429,34 @@ mod tests {
             chat_completions_endpoint("https://example.test/v1/chat/completions"),
             "https://example.test/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn parses_plain_text_and_rejects_malformed_or_empty_responses() {
+        let plain = parse_chat_response(
+            r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#,
+        )
+        .expect("plain response");
+        assert_eq!(plain.content.as_deref(), Some("hello"));
+        assert!(parse_chat_response(r#"{"choices":[]}"#).is_err());
+        assert!(parse_chat_response(r#"{"unexpected":true}"#).is_err());
+        assert!(parse_chat_response("not json").is_err());
+    }
+
+    #[test]
+    fn parses_one_and_multiple_tool_calls_with_optional_content() {
+        let one = parse_chat_response(
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.py\"}"}}]}}]}"#,
+        )
+        .expect("one tool call");
+        assert_eq!(one.tool_calls.expect("call").len(), 1);
+
+        let mixed = parse_chat_response(
+            r#"{"choices":[{"message":{"role":"assistant","content":"working","tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{}"}},{"id":"call-2","type":"function","function":{"name":"list_files","arguments":"{}"}}]}}]}"#,
+        )
+        .expect("mixed response");
+        assert_eq!(mixed.content.as_deref(), Some("working"));
+        assert_eq!(mixed.tool_calls.expect("calls").len(), 2);
     }
 
     #[tokio::test]

@@ -458,5 +458,44 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(root.path().join("a.txt")).expect("read"),
+            "x x"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_replace_rejects_missing_match_without_changing_file() {
+        let root = tempdir().expect("temp dir");
+        fs::write(root.path().join("a.txt"), "original").expect("fixture");
+        let tool = ReplaceText::new(Sandbox::new(root.path().to_path_buf()).expect("sandbox"));
+
+        let result = tool
+            .execute(json!({"path": "a.txt", "old_text": "missing", "new_text": "new"}))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(root.path().join("a.txt")).expect("read"),
+            "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_replace_changes_one_match_only() {
+        let root = tempdir().expect("temp dir");
+        fs::write(root.path().join("a.txt"), "before unique after").expect("fixture");
+        let tool = ReplaceText::new(Sandbox::new(root.path().to_path_buf()).expect("sandbox"));
+
+        let result = tool
+            .execute(json!({"path": "a.txt", "old_text": "unique", "new_text": "changed"}))
+            .await
+            .expect("replace");
+
+        assert!(result.contains("1 occurrence"));
+        assert_eq!(
+            fs::read_to_string(root.path().join("a.txt")).expect("read"),
+            "before changed after"
+        );
     }
 }

@@ -18,6 +18,13 @@ pub enum AgentPhase {
     Done,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ToolCallKey {
+    workspace_revision: u64,
+    name: String,
+    arguments: String,
+}
+
 impl AgentPhase {
     pub const fn label(self) -> &'static str {
         match self {
@@ -205,7 +212,7 @@ impl Agent {
             .filter(|definition| !is_planning_tool(&definition.function.name))
             .map(|definition| definition.function.name.as_str())
             .collect::<Vec<_>>();
-        let mut call_cache = BTreeMap::<String, (usize, String)>::new();
+        let mut call_cache = BTreeMap::<ToolCallKey, (usize, String)>::new();
         self.emit(AgentEvent::ProjectDetected {
             kind: self.project.kind.label().to_owned(),
             evidence: self.project.evidence.clone(),
@@ -316,7 +323,11 @@ impl Agent {
                     continue;
                 }
 
-                let signature = format!("{}:{}", call.function.name, call.function.arguments);
+                let signature = ToolCallKey {
+                    workspace_revision: self.workspace_revision,
+                    name: call.function.name.clone(),
+                    arguments: call.function.arguments.clone(),
+                };
                 if let Some((repeat_count, previous_result)) = call_cache.get_mut(&signature) {
                     *repeat_count += 1;
                     let observation = format!(
@@ -366,7 +377,6 @@ impl Agent {
                     );
                 }
                 if successful_workspace_mutation(&call.function.name, &raw_observation) {
-                    call_cache.clear();
                     self.workspace_revision = self.workspace_revision.saturating_add(1);
                     self.emit(AgentEvent::WorkspaceChanged {
                         revision: self.workspace_revision,
@@ -748,6 +758,35 @@ mod tests {
         output: &'static str,
     }
 
+    struct RequiredValueTool;
+
+    #[async_trait]
+    impl Tool for RequiredValueTool {
+        fn name(&self) -> &'static str {
+            "required_value"
+        }
+
+        fn description(&self) -> &'static str {
+            "requires a string value"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            })
+        }
+
+        async fn execute(&self, arguments: Value) -> Result<String> {
+            arguments
+                .get("value")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| Error::Tool("missing required string parameter 'value'".to_owned()))
+        }
+    }
+
     #[async_trait]
     impl Tool for NamedCountingTool {
         fn name(&self) -> &'static str {
@@ -787,6 +826,28 @@ mod tests {
 
     fn echo_call(id: &str) -> Message {
         tool_call(id, "echo", r#"{"value":"ok"}"#)
+    }
+
+    fn calls_with_content(content: &str, calls: &[(&str, &str, &str)]) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: Some(content.to_owned()),
+            reasoning_content: None,
+            tool_calls: Some(
+                calls
+                    .iter()
+                    .map(|(id, name, arguments)| ToolCall {
+                        id: (*id).to_owned(),
+                        kind: "function".to_owned(),
+                        function: FunctionCall {
+                            name: (*name).to_owned(),
+                            arguments: (*arguments).to_owned(),
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+        }
     }
 
     #[tokio::test]
@@ -837,6 +898,62 @@ mod tests {
 
         assert_eq!(result, "done");
         assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn multiple_calls_and_bad_tool_outputs_become_observations() {
+        let model = Arc::new(MockModel {
+            responses: Mutex::new(VecDeque::from([
+                Message::assistant("1. Exercise tool parsing and recover from errors."),
+                calls_with_content(
+                    "I will inspect these tool results.",
+                    &[
+                        ("call-1", "echo", r#"{"value":"ok"}"#),
+                        ("call-2", "read_fil", r#"{}"#),
+                        ("call-3", "echo", "{bad json"),
+                        ("call-4", "required_value", r#"{}"#),
+                    ],
+                ),
+                Message::assistant("recovered"),
+            ])),
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool).expect("echo");
+        registry.register(RequiredValueTool).expect("required tool");
+        let workspace = tempdir().expect("workspace");
+        let mut agent = Agent::new(model, registry, workspace.path(), 5, 128_000);
+
+        let result = agent.run_turn("exercise parsing").await.expect("agent run");
+
+        assert_eq!(result, "recovered");
+        let observations = agent
+            .messages()
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(observations.len(), 4);
+        assert!(observations.iter().any(|value| {
+            value.contains("unknown tool 'read_fil'") && value.contains("Available tools: echo")
+        }));
+        assert!(
+            observations
+                .iter()
+                .any(|value| value.contains("invalid tool arguments"))
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|value| value.contains("missing required string parameter"))
+        );
+        assert!(agent.messages().iter().any(|message| {
+            message.role == Role::Assistant
+                && message.content.as_deref() == Some("I will inspect these tool results.")
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.len() == 4)
+        }));
     }
 
     #[tokio::test]
