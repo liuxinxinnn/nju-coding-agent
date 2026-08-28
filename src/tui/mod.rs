@@ -1097,17 +1097,23 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .flat_map(ChatMessage::render_lines)
         .collect::<Vec<_>>();
     app.chat_height = areas.chat.height.saturating_sub(2);
-    let max_scroll = u16::try_from(chat_lines.len().saturating_sub(app.chat_height as usize))
-        .unwrap_or(u16::MAX);
+    let chat_width = areas.chat.width.saturating_sub(2).max(1);
+    let chat = Paragraph::new(chat_lines)
+        .block(Block::default().borders(Borders::ALL).title("Conversation"))
+        .wrap(Wrap { trim: false });
+    // A logical `Line` can occupy several terminal rows after wrapping. Using
+    // `chat_lines.len()` here leaves the last message below the viewport.
+    let max_scroll = u16::try_from(
+        chat.line_count(chat_width)
+            .saturating_sub(areas.chat.height as usize),
+    )
+    .unwrap_or(u16::MAX);
     if app.follow_chat {
         app.chat_scroll = max_scroll;
     } else {
         app.chat_scroll = app.chat_scroll.min(max_scroll);
     }
-    let chat = Paragraph::new(chat_lines)
-        .block(Block::default().borders(Borders::ALL).title("Conversation"))
-        .wrap(Wrap { trim: false })
-        .scroll((app.chat_scroll, 0));
+    let chat = chat.scroll((app.chat_scroll, 0));
     frame.render_widget(chat, areas.chat);
 
     if !app.events_collapsed {
@@ -1116,16 +1122,17 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             .iter()
             .map(EventEntry::render_line)
             .collect::<Vec<_>>();
-        let event_scroll = u16::try_from(
-            event_lines
-                .len()
-                .saturating_sub(areas.events.height.saturating_sub(2) as usize),
-        )
-        .unwrap_or(u16::MAX);
         let events = Paragraph::new(event_lines)
             .block(Block::default().borders(Borders::ALL).title("Events"))
-            .wrap(Wrap { trim: false })
-            .scroll((event_scroll, 0));
+            .wrap(Wrap { trim: false });
+        let event_width = areas.events.width.saturating_sub(2).max(1);
+        let event_scroll = u16::try_from(
+            events
+                .line_count(event_width)
+                .saturating_sub(areas.events.height as usize),
+        )
+        .unwrap_or(u16::MAX);
+        let events = events.scroll((event_scroll, 0));
         frame.render_widget(events, areas.events);
     }
 
@@ -1273,9 +1280,11 @@ fn format_session_list(current_id: &str, sessions: &[SessionSummary]) -> String 
 mod tests {
     use std::path::PathBuf;
 
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use tokio::sync::mpsc;
 
-    use super::{App, WorkerCommand, WorkerEvent, format_session_list};
+    use super::{App, WorkerCommand, WorkerEvent, draw, format_session_list};
     use crate::agent::{AgentEvent, AgentPhase};
     use crate::session::SessionSummary;
     use crate::tui::model::MessageRole;
@@ -1402,5 +1411,32 @@ mod tests {
 
         assert_eq!(app.messages.len(), original_messages);
         assert!(app.streaming_index.is_none());
+    }
+
+    #[test]
+    fn follow_chat_keeps_latest_user_body_visible_after_wrapped_text() {
+        let mut app = App::new(PathBuf::from("workspace"), "model".to_owned());
+        app.messages.clear();
+        app.push_message(MessageRole::Agent, "wrapped words ".repeat(24));
+        app.push_message(MessageRole::User, "LATEST_USER_BODY");
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw TUI");
+
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(rendered.contains("LATEST_USER_BODY"));
+        assert!(app.chat_scroll > 0, "wrapped rows must require scrolling");
     }
 }
