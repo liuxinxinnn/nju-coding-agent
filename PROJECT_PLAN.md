@@ -45,6 +45,7 @@ CLI
 - [已完成] 超过 80% 自动压缩，保留 system prompt、最近完整用户轮次和工具调用链。
 - [已完成] 会话本地持久化以及 `/new`、`/sessions`、`/switch`、`/delete`，切换时恢复消息和 PEV revision 状态。
 - [已完成] OpenAI-compatible SSE 流式文本输出，聚合 tool call 分片并在 TUI 中实时更新、结束时去重。
+- [已完成] 使用真实 DeepSeek SSE 验证多段 content delta、最终聚合一致性和 `reasoning_content`。
 - token 用量和更完整的可读执行轨迹。
 - 可配置 allow/block 命令规则。
 
@@ -57,7 +58,7 @@ CLI
 ### M4：提交材料
 
 - [已完成] 第一个可重置 checkout discount bug benchmark：基线 5 项测试中 2 项失败；真实模型用 8 步、24.78 秒完成一行最小修复，最终 5/5 通过。
-- 3～5 个固定 benchmark，记录成功率、步数、耗时和失败原因。
+- [已完成] 3 个固定 benchmark：Python 单文件、Python 跨文件、Rust；记录结果、步数、工具调用、耗时、revision 和文件完整性。
 - 选择稳定的跨文件真实任务录制 2 分钟内视频。
 - 编写 1000 汉字内 `README.txt`，包含公开仓库地址、运行方式和特色功能。
 - 检查凭据、`.env`、Git 历史、zip 内容、视频格式和大小。

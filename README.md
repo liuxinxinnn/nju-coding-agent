@@ -59,6 +59,10 @@ TUI 快捷键：
 - [x] 本地持久化多轮会话，支持新建、列表、切换和删除
 - [x] 流式聚合文本、`reasoning_content` 与 tool call 参数，并在 TUI 中增量显示
 - [x] 补齐模型响应与工具错误矩阵、严格编辑语义、revision-aware 去重、符号链接逃逸和上下文工具调用原子性测试
+- [x] 建立 Python 单文件、Python 跨文件和 Rust 三组 benchmark，真实模型均经最新版 PEV 修复并通过独立 5/5 验收
+- [x] 使用真实 DeepSeek SSE 验证 94 个增量片段正确聚合，且成功接收 `reasoning_content`
+
+三组真实模型结果及统一指标见 [benchmarks/RESULTS.md](benchmarks/RESULTS.md)。
 
 ## Plan → Execute → Verify
 

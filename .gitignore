@@ -1,9 +1,11 @@
 /target/
+/target-benchmark-agent/
 /.idea/
 /.vscode/
 .env
 .env.*
 !.env.example
 *.log
-/benchmarks/checkout_discount/workspace/
+/benchmarks/*/workspace/
+/benchmarks/*/last-run.json
 /.nju-coding-agent-data/

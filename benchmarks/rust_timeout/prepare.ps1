@@ -19,4 +19,4 @@ Get-ChildItem -LiteralPath $fixture -Force | ForEach-Object {
 }
 
 Write-Output "Benchmark workspace prepared: $workspace"
-Write-Output "Expected baseline: 5 tests run, 2 failures caused by one defect."
+Write-Output "Expected baseline: 5 tests run, 2 failures caused by suffix parsing order."

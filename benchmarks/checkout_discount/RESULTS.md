@@ -27,8 +27,16 @@
 
 ## PEV real-model rerun
 
-待用当前 `PLAN → EXECUTE → VERIFY → DONE` 实现重跑。`run_agent.ps1` 除了独立测试和测试文件哈希外，还会检查：
+日期：2026-08-28。模型：`deepseek-v4-flash`。使用当前 revision-aware `PLAN → EXECUTE → VERIFY → DONE` 实现重跑。
 
-- 轨迹最终真实进入 `DONE`。
-- 修改后的最新 `workspace_revision` 存在 `VerificationPassed`证据。
-- 输出完整阶段序列、revision、步数、工具数和耗时。
+| 指标 | 结果 |
+|---|---|
+| Agent / 最终测试 | PASS / 5/5 通过 |
+| 阶段序列 | `PLAN → EXEC → VERIFY → DONE` |
+| Agent 步数 / 工具调用 | 6 / 7 |
+| Workspace revision | 1，当前 revision 验证通过 |
+| 耗时 | 19.25 秒 |
+| 测试文件 | SHA-256 一致，未修改 |
+| 要求修改的生产文件 | `checkout.py` 已修改 |
+
+结论：最新版 runtime 在修改后进入 VERIFY，只有真实测试返回退出码 0 才允许进入 DONE；独立验收再次确认 5/5 通过。

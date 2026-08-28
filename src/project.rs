@@ -288,4 +288,118 @@ mod tests {
         assert_eq!(profile.kind, ProjectKind::Unknown);
         assert_eq!(profile.verification_command, None);
     }
+
+    #[test]
+    fn detects_pytest_from_each_supported_marker() {
+        for (name, content, evidence) in [
+            (
+                "pyproject.toml",
+                "[tool.pytest.ini_options]",
+                "pyproject.toml",
+            ),
+            ("pytest.ini", "[pytest]", "pytest.ini"),
+            ("tox.ini", "[testenv]", "tox.ini"),
+            (
+                "requirements.txt",
+                "pytest>=8\n",
+                "requirements.txt (pytest)",
+            ),
+        ] {
+            let workspace = tempdir().expect("workspace");
+            fs::write(workspace.path().join(name), content).expect("marker");
+
+            let profile = ProjectProfile::detect(workspace.path());
+
+            assert_eq!(profile.kind, ProjectKind::PythonPytest, "{name}");
+            assert_eq!(profile.evidence, vec![evidence.to_owned()], "{name}");
+            assert_eq!(
+                profile.verification_command.as_deref(),
+                Some("python -m pytest"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_maven_and_prefers_windows_wrapper() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("pom.xml"), "<project/>").expect("manifest");
+        fs::write(workspace.path().join("mvnw.cmd"), "").expect("wrapper");
+
+        let profile = ProjectProfile::detect(workspace.path());
+
+        assert_eq!(profile.kind, ProjectKind::Maven);
+        assert_eq!(
+            profile.verification_command.as_deref(),
+            Some(r".\mvnw.cmd test")
+        );
+    }
+
+    #[test]
+    fn detects_gradle_kotlin_and_prefers_windows_wrapper() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("build.gradle.kts"), "plugins {}").expect("manifest");
+        fs::write(workspace.path().join("gradlew.bat"), "").expect("wrapper");
+
+        let profile = ProjectProfile::detect(workspace.path());
+
+        assert_eq!(profile.kind, ProjectKind::Gradle);
+        assert_eq!(profile.evidence, vec!["build.gradle.kts"]);
+        assert_eq!(
+            profile.verification_command.as_deref(),
+            Some(r".\gradlew.bat test")
+        );
+    }
+
+    #[test]
+    fn detects_go_project() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("go.mod"), "module example.test/demo").expect("manifest");
+
+        let profile = ProjectProfile::detect(workspace.path());
+
+        assert_eq!(profile.kind, ProjectKind::Go);
+        assert_eq!(
+            profile.verification_command.as_deref(),
+            Some("go test ./...")
+        );
+    }
+
+    #[test]
+    fn detects_dotnet_solution_and_project() {
+        for marker in ["Demo.sln", "Demo.csproj"] {
+            let workspace = tempdir().expect("workspace");
+            fs::write(workspace.path().join(marker), "").expect("manifest");
+
+            let profile = ProjectProfile::detect(workspace.path());
+
+            assert_eq!(profile.kind, ProjectKind::DotNet, "{marker}");
+            assert_eq!(profile.evidence, vec![marker.to_owned()], "{marker}");
+            assert_eq!(profile.verification_command.as_deref(), Some("dotnet test"));
+        }
+    }
+
+    #[test]
+    fn node_falls_back_to_build_then_lint_without_a_real_test_script() {
+        for (scripts, expected) in [
+            (
+                json!({"test": "echo Error: no test specified", "build": "vite build"}),
+                Some("npm run build"),
+            ),
+            (json!({"lint": "eslint ."}), Some("npm run lint")),
+            (json!({"start": "node app.js"}), None),
+        ] {
+            let workspace = tempdir().expect("workspace");
+            fs::write(
+                workspace.path().join("package.json"),
+                serde_json::to_vec(&json!({"scripts": scripts})).expect("json"),
+            )
+            .expect("manifest");
+
+            let profile = ProjectProfile::detect(workspace.path());
+
+            assert_eq!(profile.kind, ProjectKind::Node);
+            assert_eq!(profile.verification_command.as_deref(), expected);
+        }
+    }
 }
