@@ -29,6 +29,8 @@ cargo run -- --workspace D:\path\to\project "修复测试失败并运行测试�
 
 不传任务文本时默认进入全屏 TUI。高风险或未知命令会在界面中弹出确认框；演示环境可显式传入 `--yes`。需要简单逐行模式时使用 `--plain`。
 
+TUI 中的计划和最终回答会随 DeepSeek SSE 增量实时显示；tool call 分片在本地聚合完成后才执行，流式失败且尚未显示文本时自动降级为普通请求。
+
 TUI 快捷键：
 
 - `Enter` 发送，`Shift+Enter` 换行。
@@ -53,6 +55,7 @@ TUI 快捷键：
 - [x] 实现运行时约束的 `PLAN → EXECUTE → VERIFY → DONE` 状态机
 - [x] 确定性检测 Rust、Python、Node.js、Maven、Gradle、Go 和 .NET 项目并选择验证命令
 - [x] 本地持久化多轮会话，支持新建、列表、切换和删除
+- [x] 流式聚合文本、`reasoning_content` 与 tool call 参数，并在 TUI 中增量显示
 
 ## Plan → Execute → Verify
 
@@ -92,6 +95,7 @@ Windows 默认保存到 `%LOCALAPPDATA%\nju-coding-agent\sessions`；也可通�
 - 未知工具、坏 JSON 参数、工具失败都会变成 observation 交回模型纠正。
 - 模型既不返回文本也不返回工具调用时明确报错。
 - 工具输出统一截断，避免大文件或命令输出撑爆上下文。
+- 最新的读取、列表和搜索结果会标记为当前 workspace 的权威证据，提醒模型不得沿用旧会话中的冲突值。
 - 上下文达到配置窗口的 80% 时自动生成本地摘要，并压缩到约 60% 的预算目标。
 - 相同非只读命令批准一次后，本次运行中不再重复询问；`--yes` 可自动批准普通命令，但不能绕过危险命令与 workspace 外路径拦截。
 

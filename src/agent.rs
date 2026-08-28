@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::ContextManager;
 use crate::error::{Error, Result};
-use crate::llm::{LanguageModel, Message, Role};
+use crate::llm::{DeltaHandler, LanguageModel, Message, Role};
 use crate::project::ProjectProfile;
 use crate::tool::ToolRegistry;
 
@@ -52,6 +52,11 @@ pub enum AgentEvent {
     Thinking {
         step: usize,
         phase: AgentPhase,
+    },
+    TextDelta {
+        step: usize,
+        phase: AgentPhase,
+        delta: String,
     },
     ToolCall {
         step: usize,
@@ -239,9 +244,20 @@ impl Agent {
                     after_tokens: event.after_tokens,
                 });
             }
+            let delta_events = self.event_handler.clone();
+            let response_phase = self.phase;
+            let delta_handler: DeltaHandler = Arc::new(move |delta| {
+                if let Some(handler) = &delta_events {
+                    handler(AgentEvent::TextDelta {
+                        step,
+                        phase: response_phase,
+                        delta: delta.to_owned(),
+                    });
+                }
+            });
             let response = self
                 .model
-                .complete(&self.messages, active_definitions)
+                .complete_stream(&self.messages, active_definitions, delta_handler)
                 .await?;
             let tool_calls = response.tool_calls.clone().unwrap_or_default();
             let final_text = response.content.clone().unwrap_or_default();
@@ -342,6 +358,13 @@ impl Agent {
                 });
 
                 let mut observation = raw_observation.clone();
+                if is_grounding_tool(&call.function.name) && !raw_observation.starts_with("ERROR:")
+                {
+                    append_runtime_note(
+                        &mut observation,
+                        "This latest tool result is authoritative for the current workspace. Base subsequent factual claims on it, quote exact values carefully, and do not reuse conflicting details from older conversation turns.",
+                    );
+                }
                 if successful_workspace_mutation(&call.function.name, &raw_observation) {
                     call_cache.clear();
                     self.workspace_revision = self.workspace_revision.saturating_add(1);
@@ -429,6 +452,7 @@ impl Agent {
             AgentEvent::Thinking { step, phase } => {
                 println!("[{} step {step}] thinking", phase.label())
             }
+            AgentEvent::TextDelta { .. } => {}
             AgentEvent::ToolCall {
                 step,
                 phase,
@@ -474,6 +498,10 @@ fn successful_workspace_mutation(tool_name: &str, observation: &str) -> bool {
 
 fn is_workspace_mutation(tool_name: &str) -> bool {
     matches!(tool_name, "write_file" | "replace_text")
+}
+
+fn is_grounding_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "read_file" | "list_files" | "search_text")
 }
 
 fn planning_tool_definitions(
@@ -890,6 +918,39 @@ mod tests {
                 .content
                 .as_deref()
                 .is_some_and(|content| content.contains("not allowed during PLAN"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn marks_latest_read_result_as_authoritative_context() {
+        let model = Arc::new(MockModel {
+            responses: Mutex::new(VecDeque::from([
+                Message::assistant("1. Read the file and report its exact value."),
+                tool_call("call-1", "read_file", r#"{"path":"hello.py"}"#),
+                Message::assistant("The file prints Hello Session B."),
+            ])),
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(NamedCountingTool {
+                name: "read_file",
+                executions,
+                output: "1 print(\"Hello Session B\")",
+            })
+            .expect("register read tool");
+        let workspace = tempdir().expect("workspace");
+        let mut agent = Agent::new(model, registry, workspace.path(), 5, 128_000);
+
+        let result = agent.run_turn("inspect hello.py").await.expect("agent run");
+
+        assert_eq!(result, "The file prints Hello Session B.");
+        assert!(agent.messages().iter().any(|message| {
+            message.role == Role::Tool
+                && message.content.as_deref().is_some_and(|content| {
+                    content.contains("latest tool result is authoritative")
+                        && content.contains("Hello Session B")
+                })
         }));
     }
 

@@ -82,6 +82,29 @@ impl ChatMessage {
         lines.push(Line::from(String::new()));
         lines
     }
+
+    pub(super) fn append(&mut self, delta: &str) {
+        self.content.push_str(delta);
+    }
+
+    pub(super) fn finalize(&mut self, role: MessageRole, content: &str) {
+        self.role = role;
+        content.clone_into(&mut self.content);
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.content.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) const fn role(&self) -> MessageRole {
+        self.role
+    }
+
+    #[cfg(test)]
+    pub(super) fn content(&self) -> &str {
+        &self.content
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -180,7 +203,7 @@ pub(super) fn summarize_arguments(arguments: &str) -> String {
 pub(super) fn summarize_result(result: &str) -> String {
     let flattened = result
         .lines()
-        .map(str::trim)
+        .map(|line| line.trim().replace('\t', "  "))
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join(" | ");
@@ -192,4 +215,17 @@ fn truncate(value: &str, max_chars: usize) -> String {
         return value.to_owned();
     }
     format!("{}...", value.chars().take(max_chars).collect::<String>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_result;
+
+    #[test]
+    fn result_summary_makes_numbered_file_lines_readable() {
+        assert_eq!(
+            summarize_result("     1\tprint(\"Hello Session B\")\n"),
+            "1  print(\"Hello Session B\")"
+        );
+    }
 }

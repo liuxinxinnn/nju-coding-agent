@@ -33,6 +33,7 @@ use terminal::TerminalGuard;
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_MESSAGES: usize = 240;
 const MAX_EVENTS: usize = 500;
+const MAX_WORKER_EVENTS_PER_TICK: usize = 256;
 
 enum WorkerCommand {
     Chat(String),
@@ -101,6 +102,8 @@ struct App {
     follow_chat: bool,
     chat_height: u16,
     pending_confirmation: Option<PendingConfirmation>,
+    streaming_index: Option<usize>,
+    streaming_phase: Option<AgentPhase>,
 }
 
 impl App {
@@ -132,6 +135,8 @@ impl App {
             follow_chat: true,
             chat_height: 10,
             pending_confirmation: None,
+            streaming_index: None,
+            streaming_phase: None,
         }
     }
 
@@ -166,6 +171,7 @@ impl App {
                 self.push_event(EventKind::Info, "Agent 初始化完成");
             }
             WorkerEvent::Started => {
+                self.discard_streaming();
                 self.busy = true;
                 self.status = "执行中".to_owned();
             }
@@ -199,7 +205,7 @@ impl App {
                     );
                 }
                 AgentEvent::PlanCreated { plan } => {
-                    self.push_message(MessageRole::Plan, plan.clone());
+                    self.finalize_streaming(MessageRole::Plan, &plan);
                     self.push_event(
                         EventKind::Plan,
                         format!("计划 · {}", summarize_result(&plan)),
@@ -210,12 +216,18 @@ impl App {
                     self.status = format!("{} · step {step}", phase.label());
                     self.push_event(phase_event_kind(phase), format!("#{step} 模型思考"));
                 }
+                AgentEvent::TextDelta { step, phase, delta } => {
+                    self.phase = phase;
+                    self.status = format!("{} · step {step} · 流式输出", phase.label());
+                    self.append_streaming_delta(phase, &delta);
+                }
                 AgentEvent::ToolCall {
                     step,
                     phase,
                     name,
                     arguments,
                 } => {
+                    self.discard_streaming();
                     self.phase = phase;
                     self.status = format!("{} · {name}", phase.label());
                     self.push_event(
@@ -272,6 +284,7 @@ impl App {
                     workspace_revision,
                     last_verified_revision,
                 } => {
+                    self.discard_streaming();
                     self.workspace_revision = workspace_revision;
                     self.last_verified_revision = last_verified_revision;
                     self.push_event(
@@ -285,10 +298,11 @@ impl App {
                 match result {
                     Ok(answer) => {
                         self.status = "就绪".to_owned();
-                        self.push_message(MessageRole::Agent, answer);
+                        self.finalize_streaming(MessageRole::Agent, &answer);
                         self.push_event(EventKind::State, "任务完成");
                     }
                     Err(error) => {
+                        self.discard_streaming();
                         self.status = "失败".to_owned();
                         self.push_message(MessageRole::Error, error.clone());
                         self.push_event(EventKind::Error, error);
@@ -302,6 +316,7 @@ impl App {
                 workspace_revision,
                 last_verified_revision,
             } => {
+                self.discard_streaming();
                 self.session_id = id.clone();
                 self.workspace_revision = workspace_revision;
                 self.last_verified_revision = last_verified_revision;
@@ -334,6 +349,7 @@ impl App {
                 self.pending_confirmation = Some(PendingConfirmation { prompt, response });
             }
             WorkerEvent::Fatal(error) => {
+                self.discard_streaming();
                 self.busy = false;
                 self.status = "初始化失败".to_owned();
                 self.push_message(MessageRole::Error, error.clone());
@@ -369,6 +385,66 @@ impl App {
                 Role::System | Role::Assistant | Role::Tool => {}
             }
         }
+    }
+
+    fn append_streaming_delta(&mut self, phase: AgentPhase, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.streaming_phase.is_some_and(|active| active != phase) {
+            self.discard_streaming();
+        }
+        if self.streaming_index.is_none() {
+            if self.messages.len() >= MAX_MESSAGES {
+                self.messages.remove(0);
+            }
+            let role = if phase == AgentPhase::Planning {
+                MessageRole::Plan
+            } else {
+                MessageRole::Agent
+            };
+            self.messages.push(ChatMessage::new(role, ""));
+            self.streaming_index = Some(self.messages.len().saturating_sub(1));
+            self.streaming_phase = Some(phase);
+        }
+        if let Some(message) = self
+            .streaming_index
+            .and_then(|index| self.messages.get_mut(index))
+        {
+            message.append(delta);
+        }
+        self.follow_chat = true;
+    }
+
+    fn finalize_streaming(&mut self, role: MessageRole, final_text: &str) {
+        let index = self.streaming_index.take();
+        self.streaming_phase = None;
+        match index {
+            Some(index)
+                if final_text.is_empty()
+                    && self.messages.get(index).is_some_and(ChatMessage::is_empty) =>
+            {
+                self.messages.remove(index);
+            }
+            Some(_) if final_text.is_empty() => {}
+            Some(index) => {
+                if let Some(message) = self.messages.get_mut(index) {
+                    message.finalize(role, final_text);
+                }
+            }
+            None if !final_text.is_empty() => self.push_message(role, final_text),
+            None => {}
+        }
+        self.follow_chat = true;
+    }
+
+    fn discard_streaming(&mut self) {
+        if let Some(index) = self.streaming_index.take()
+            && index < self.messages.len()
+        {
+            self.messages.remove(index);
+        }
+        self.streaming_phase = None;
     }
 
     fn submit(&mut self, command_tx: &mpsc::UnboundedSender<WorkerCommand>) {
@@ -495,7 +571,10 @@ pub async fn run(config: Config) -> Result<()> {
     let mut terminal = TerminalGuard::new()?;
 
     while !app.should_quit {
-        while let Ok(event) = event_rx.try_recv() {
+        for _ in 0..MAX_WORKER_EVENTS_PER_TICK {
+            let Ok(event) = event_rx.try_recv() else {
+                break;
+            };
             app.apply_worker_event(event);
         }
         terminal.terminal.draw(|frame| draw(frame, &mut app))?;
@@ -1049,8 +1128,10 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use super::{App, WorkerCommand, format_session_list};
+    use super::{App, WorkerCommand, WorkerEvent, format_session_list};
+    use crate::agent::{AgentEvent, AgentPhase};
     use crate::session::SessionSummary;
+    use crate::tui::model::MessageRole;
 
     #[test]
     fn session_commands_are_dispatched_with_the_requested_id() {
@@ -1096,5 +1177,71 @@ mod tests {
         assert!(output.contains("fix checkout"));
         assert!(output.contains("rev 2"));
         assert!(output.contains("/switch"));
+    }
+
+    #[test]
+    fn streamed_plan_and_final_answer_are_finalized_without_duplicates() {
+        let mut app = App::new(PathBuf::from("workspace"), "model".to_owned());
+        app.apply_worker_event(WorkerEvent::Started);
+        app.apply_worker_event(WorkerEvent::Agent(AgentEvent::TextDelta {
+            step: 1,
+            phase: AgentPhase::Planning,
+            delta: "1. Read ".to_owned(),
+        }));
+        app.apply_worker_event(WorkerEvent::Agent(AgentEvent::TextDelta {
+            step: 1,
+            phase: AgentPhase::Planning,
+            delta: "the file.".to_owned(),
+        }));
+        app.apply_worker_event(WorkerEvent::Agent(AgentEvent::PlanCreated {
+            plan: "1. Read the file.".to_owned(),
+        }));
+        app.apply_worker_event(WorkerEvent::Agent(AgentEvent::TextDelta {
+            step: 2,
+            phase: AgentPhase::Executing,
+            delta: "Hello ".to_owned(),
+        }));
+        app.apply_worker_event(WorkerEvent::Agent(AgentEvent::TextDelta {
+            step: 2,
+            phase: AgentPhase::Executing,
+            delta: "Session B".to_owned(),
+        }));
+        app.apply_worker_event(WorkerEvent::Done(Ok("Hello Session B".to_owned())));
+
+        let plan_messages = app
+            .messages
+            .iter()
+            .filter(|message| message.role() == MessageRole::Plan)
+            .collect::<Vec<_>>();
+        let agent_messages = app
+            .messages
+            .iter()
+            .filter(|message| message.role() == MessageRole::Agent)
+            .collect::<Vec<_>>();
+        assert_eq!(plan_messages.len(), 1);
+        assert_eq!(plan_messages[0].content(), "1. Read the file.");
+        assert_eq!(agent_messages.len(), 1);
+        assert_eq!(agent_messages[0].content(), "Hello Session B");
+        assert!(app.streaming_index.is_none());
+    }
+
+    #[test]
+    fn streamed_text_attached_to_a_tool_call_is_temporary() {
+        let mut app = App::new(PathBuf::from("workspace"), "model".to_owned());
+        let original_messages = app.messages.len();
+        app.apply_worker_event(WorkerEvent::Agent(AgentEvent::TextDelta {
+            step: 1,
+            phase: AgentPhase::Planning,
+            delta: "I will inspect it.".to_owned(),
+        }));
+        app.apply_worker_event(WorkerEvent::Agent(AgentEvent::ToolCall {
+            step: 1,
+            phase: AgentPhase::Planning,
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"hello.py"}"#.to_owned(),
+        }));
+
+        assert_eq!(app.messages.len(), original_messages);
+        assert!(app.streaming_index.is_none());
     }
 }
