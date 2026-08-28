@@ -18,6 +18,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
 use crate::agent::{AgentEvent, AgentPhase};
+use crate::context::{ContextUsage, DEFAULT_CONTEXT_WINDOW_TOKENS};
 use crate::llm::{Message, Role};
 use crate::session::{SessionStore, SessionSummary, StoredSession};
 use crate::tools::{ApprovalFn, default_registry_with_approval};
@@ -37,6 +38,7 @@ const MAX_WORKER_EVENTS_PER_TICK: usize = 256;
 
 enum WorkerCommand {
     Chat(String),
+    SetPlanMode(bool),
     NewSession,
     ListSessions,
     SwitchSession(String),
@@ -60,7 +62,15 @@ enum WorkerEvent {
         messages: Vec<Message>,
         workspace_revision: u64,
         last_verified_revision: Option<u64>,
+        planning_enabled: bool,
+        context_usage: ContextUsage,
+        message_count: usize,
     },
+    ContextUpdated {
+        usage: ContextUsage,
+        message_count: usize,
+    },
+    PlanModeChanged(bool),
     SessionList {
         current_id: String,
         sessions: Vec<SessionSummary>,
@@ -97,6 +107,10 @@ struct App {
     session_data_dir: Option<PathBuf>,
     should_quit: bool,
     show_help: bool,
+    show_context: bool,
+    context_usage: ContextUsage,
+    message_count: usize,
+    planning_enabled: bool,
     events_collapsed: bool,
     chat_scroll: u16,
     follow_chat: bool,
@@ -130,6 +144,10 @@ impl App {
             session_data_dir: None,
             should_quit: false,
             show_help: false,
+            show_context: false,
+            context_usage: ContextUsage::empty(DEFAULT_CONTEXT_WINDOW_TOKENS),
+            message_count: 0,
+            planning_enabled: true,
             events_collapsed: false,
             chat_scroll: 0,
             follow_chat: true,
@@ -315,11 +333,17 @@ impl App {
                 messages,
                 workspace_revision,
                 last_verified_revision,
+                planning_enabled,
+                context_usage,
+                message_count,
             } => {
                 self.discard_streaming();
                 self.session_id = id.clone();
                 self.workspace_revision = workspace_revision;
                 self.last_verified_revision = last_verified_revision;
+                self.planning_enabled = planning_enabled;
+                self.context_usage = context_usage;
+                self.message_count = message_count;
                 self.phase = AgentPhase::Done;
                 self.status = "就绪".to_owned();
                 self.busy = false;
@@ -329,6 +353,32 @@ impl App {
                 self.push_event(
                     EventKind::Session,
                     format!("当前会话 {} · {title}", short_session_id(&id)),
+                );
+            }
+            WorkerEvent::ContextUpdated {
+                usage,
+                message_count,
+            } => {
+                self.context_usage = usage;
+                self.message_count = message_count;
+            }
+            WorkerEvent::PlanModeChanged(enabled) => {
+                self.planning_enabled = enabled;
+                self.push_message(
+                    MessageRole::System,
+                    format!(
+                        "Plan 模式已{}。{}",
+                        if enabled { "开启" } else { "关闭" },
+                        if enabled {
+                            "后续任务执行 PLAN → EXECUTE → VERIFY。"
+                        } else {
+                            "后续任务直接 EXECUTE → VERIFY；修改后的验证要求仍然有效。"
+                        }
+                    ),
+                );
+                self.push_event(
+                    EventKind::State,
+                    format!("Plan mode {}", if enabled { "ON" } else { "OFF" }),
                 );
             }
             WorkerEvent::SessionList {
@@ -475,7 +525,14 @@ impl App {
         let name = parts.next().unwrap_or_default();
         match name {
             "/exit" | "/quit" => self.should_quit = true,
-            "/help" => self.show_help = !self.show_help,
+            "/help" => {
+                self.show_context = false;
+                self.show_help = !self.show_help;
+            }
+            "/context" if parts.next().is_none() => {
+                self.show_help = false;
+                self.show_context = !self.show_context;
+            }
             "/clear" => {
                 self.messages.clear();
                 self.events.clear();
@@ -487,12 +544,16 @@ impl App {
             "/status" => self.push_message(
                 MessageRole::System,
                 format!(
-                    "状态：{}\n会话：{}\n阶段：{}\n版本：rev {} / {}\n项目：{}\n验证：{}\n模型：{}\nWorkspace：{}\n会话目录：{}",
+                    "状态：{}\n会话：{}\nPlan：{}\n阶段：{}\n版本：rev {} / {}\n上下文：{} / {} tokens ({}%)\n项目：{}\n验证：{}\n模型：{}\nWorkspace：{}\n会话目录：{}",
                     self.status,
                     self.session_id,
+                    if self.planning_enabled { "ON" } else { "OFF" },
                     self.phase.label(),
                     self.workspace_revision,
                     verification_label(self.workspace_revision, self.last_verified_revision),
+                    self.context_usage.used_tokens,
+                    self.context_usage.window_tokens,
+                    self.context_usage.used_percent(),
                     self.project_kind,
                     self.verification_command.as_deref().unwrap_or("模型选择"),
                     self.model,
@@ -510,6 +571,22 @@ impl App {
                 };
                 self.push_message(MessageRole::System, format!("可用工具：\n- {tools}"));
             }
+            "/plan" => match (parts.next(), parts.next()) {
+                (None, None) => self.push_message(
+                    MessageRole::System,
+                    format!(
+                        "Plan 模式：{}。使用 /plan on 或 /plan off 切换；Verify 约束始终开启。",
+                        if self.planning_enabled { "ON" } else { "OFF" }
+                    ),
+                ),
+                (Some("on"), None) => {
+                    self.send_session_command(command_tx, WorkerCommand::SetPlanMode(true))
+                }
+                (Some("off"), None) => {
+                    self.send_session_command(command_tx, WorkerCommand::SetPlanMode(false))
+                }
+                _ => self.push_message(MessageRole::Error, "用法：/plan [on|off]"),
+            },
             "/new" if parts.next().is_none() => {
                 self.send_session_command(command_tx, WorkerCommand::NewSession)
             }
@@ -566,8 +643,12 @@ pub async fn run(config: Config) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let workspace = config.workspace.clone();
     let model = config.model.clone();
+    let context_window_tokens = config.context_window_tokens;
+    let planning_enabled = config.planning_enabled;
     let worker = tokio::spawn(worker_loop(config, command_rx, event_tx));
     let mut app = App::new(workspace, model);
+    app.context_usage = ContextUsage::empty(context_window_tokens);
+    app.planning_enabled = planning_enabled;
     let mut terminal = TerminalGuard::new()?;
 
     while !app.should_quit {
@@ -655,6 +736,7 @@ async fn worker_loop(
         config.max_steps,
         config.context_window_tokens,
     );
+    agent.set_planning_enabled(config.planning_enabled);
     let agent_events = event_tx.clone();
     agent.on_event(move |event| {
         let _ = agent_events.send(WorkerEvent::Agent(event));
@@ -689,13 +771,24 @@ async fn worker_loop(
             return;
         }
     };
+    // `--no-plan` is an explicit startup override. With the default setting,
+    // an existing session keeps its own persisted Plan preference.
+    if !config.planning_enabled && agent.planning_enabled() {
+        agent.set_planning_enabled(false);
+        current_session.update(agent.export_state(), None);
+        if let Err(error) = store.save(&current_session) {
+            let _ = event_tx.send(WorkerEvent::Notice(format!(
+                "无法保存 --no-plan 会话设置：{error}"
+            )));
+        }
+    }
     let _ = event_tx.send(WorkerEvent::Ready {
         tools: tool_names,
         data_dir: store.root().to_path_buf(),
         project_kind: agent.project_profile().kind.label().to_owned(),
         verification_command: agent.project_profile().verification_command.clone(),
     });
-    send_session_changed(&event_tx, &current_session);
+    send_session_changed(&event_tx, &current_session, &agent);
 
     while let Some(command) = command_rx.recv().await {
         match command {
@@ -709,7 +802,25 @@ async fn worker_loop(
                 if let Err(error) = store.save(&current_session) {
                     let _ = event_tx.send(WorkerEvent::Notice(format!("会话保存失败：{error}")));
                 }
+                send_context_updated(&event_tx, &agent);
                 let _ = event_tx.send(WorkerEvent::Done(result));
+            }
+            WorkerCommand::SetPlanMode(enabled) => {
+                let previous = agent.planning_enabled();
+                agent.set_planning_enabled(enabled);
+                current_session.update(agent.export_state(), None);
+                match store.save(&current_session) {
+                    Ok(()) => {
+                        let _ = event_tx.send(WorkerEvent::PlanModeChanged(enabled));
+                        send_context_updated(&event_tx, &agent);
+                    }
+                    Err(error) => {
+                        agent.set_planning_enabled(previous);
+                        current_session.update(agent.export_state(), None);
+                        let _ = event_tx
+                            .send(WorkerEvent::Notice(format!("Plan 模式保存失败：{error}")));
+                    }
+                }
             }
             WorkerCommand::NewSession => {
                 current_session.update(agent.export_state(), None);
@@ -722,7 +833,7 @@ async fn worker_loop(
                 match store.create(&config.workspace, agent.export_state()) {
                     Ok(session) => {
                         current_session = session;
-                        send_session_changed(&event_tx, &current_session);
+                        send_session_changed(&event_tx, &current_session, &agent);
                     }
                     Err(error) => {
                         let _ = agent.restore_state(current_session.state.clone());
@@ -759,7 +870,7 @@ async fn worker_loop(
                     Ok(session) => match agent.restore_state(session.state.clone()) {
                         Ok(()) => {
                             current_session = session;
-                            send_session_changed(&event_tx, &current_session);
+                            send_session_changed(&event_tx, &current_session, &agent);
                         }
                         Err(error) => {
                             let _ = event_tx
@@ -780,7 +891,7 @@ async fn worker_loop(
                         Ok(replacement) => match store.delete(&session.id) {
                             Ok(id) => {
                                 current_session = replacement;
-                                send_session_changed(&event_tx, &current_session);
+                                send_session_changed(&event_tx, &current_session, &agent);
                                 let _ =
                                     event_tx.send(WorkerEvent::Notice(format!("已删除会话 {id}")));
                             }
@@ -826,13 +937,27 @@ async fn worker_loop(
     }
 }
 
-fn send_session_changed(event_tx: &mpsc::UnboundedSender<WorkerEvent>, session: &StoredSession) {
+fn send_session_changed(
+    event_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    session: &StoredSession,
+    agent: &Agent,
+) {
     let _ = event_tx.send(WorkerEvent::SessionChanged {
         id: session.id.clone(),
         title: session.title.clone(),
         messages: session.state.messages.clone(),
         workspace_revision: session.state.workspace_revision,
         last_verified_revision: session.state.last_verified_revision,
+        planning_enabled: agent.planning_enabled(),
+        context_usage: agent.context_usage(),
+        message_count: session.state.messages.len(),
+    });
+}
+
+fn send_context_updated(event_tx: &mpsc::UnboundedSender<WorkerEvent>, agent: &Agent) {
+    let _ = event_tx.send(WorkerEvent::ContextUpdated {
+        usage: agent.context_usage(),
+        message_count: agent.messages().len(),
     });
 }
 
@@ -850,6 +975,12 @@ fn handle_key(app: &mut App, key: KeyEvent, command_tx: &mpsc::UnboundedSender<W
     if app.show_help {
         if matches!(key.code, KeyCode::F(1) | KeyCode::Esc) {
             app.show_help = false;
+        }
+        return;
+    }
+    if app.show_context {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+            app.show_context = false;
         }
         return;
     }
@@ -923,7 +1054,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         )),
         Line::from(format!("Workspace  {}", display_path(&app.workspace))),
         Line::from(format!("Session    {}", short_session_id(&app.session_id))),
-        Line::from("F1 帮助 · Ctrl+L 事件栏 · Ctrl+D 退出"),
+        Line::from("F1 帮助 · /context 用量 · Ctrl+L 事件栏 · Ctrl+D 退出"),
     ])
     .block(Block::default().borders(Borders::ALL).title("Workspace"));
     frame.render_widget(workspace, areas.workspace);
@@ -950,7 +1081,12 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             app.project_kind,
             app.verification_command.as_deref().unwrap_or("模型选择")
         )),
-        Line::from(format!("模型  {}", app.model)),
+        Line::from(format!(
+            "模型  {} · Plan {} · Context {}%",
+            app.model,
+            if app.planning_enabled { "ON" } else { "OFF" },
+            app.context_usage.used_percent()
+        )),
     ])
     .block(Block::default().borders(Borders::ALL).title("Runtime"));
     frame.render_widget(runtime, areas.runtime);
@@ -1027,11 +1163,11 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             " F1 ",
             Style::default().fg(Color::Black).bg(Color::LightCyan),
         ),
-        Span::raw("帮助"),
+        Span::raw("帮助 · /context · /plan on|off"),
     ]));
     frame.render_widget(footer, areas.footer);
 
-    if app.pending_confirmation.is_none() && !app.show_help {
+    if app.pending_confirmation.is_none() && !app.show_help && !app.show_context {
         let visible_line = app.input.cursor_line.saturating_sub(input_scroll as usize);
         let x = areas
             .input
@@ -1049,6 +1185,8 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         overlay::draw_confirmation(frame, &pending.prompt);
     } else if app.show_help {
         overlay::draw_help(frame);
+    } else if app.show_context {
+        overlay::draw_context(frame, app.context_usage, app.message_count);
     }
 }
 
@@ -1114,8 +1252,17 @@ fn format_session_list(current_id: &str, sessions: &[SessionSummary]) -> String 
         let verification =
             verification_label(session.workspace_revision, session.last_verified_revision);
         output.push_str(&format!(
-            "{marker} {}  {}  rev {} {}  {}\n",
-            session.id, session.title, session.workspace_revision, verification, session.updated_at
+            "{marker} {}  {}  rev {} {}  plan {}  {}\n",
+            session.id,
+            session.title,
+            session.workspace_revision,
+            verification,
+            if session.planning_enabled {
+                "on"
+            } else {
+                "off"
+            },
+            session.updated_at
         ));
     }
     output.push_str("\n使用 /switch <id或唯一前缀> 切换。");
@@ -1158,6 +1305,17 @@ mod tests {
             receiver.try_recv(),
             Ok(WorkerCommand::DeleteSession(id)) if id == "def456"
         ));
+
+        app.handle_command("/plan off", &sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WorkerCommand::SetPlanMode(false))
+        ));
+
+        app.handle_command("/context", &sender);
+        assert!(app.show_context);
+        app.handle_command("/context", &sender);
+        assert!(!app.show_context);
     }
 
     #[test]
@@ -1169,6 +1327,7 @@ mod tests {
             updated_at: "2026-08-27T20:00:00+08:00".to_owned(),
             workspace_revision: 2,
             last_verified_revision: Some(2),
+            planning_enabled: true,
         }];
 
         let output = format_session_list("session-123", &sessions);

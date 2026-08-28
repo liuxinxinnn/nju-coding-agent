@@ -12,6 +12,7 @@ pub struct Config {
     pub max_steps: usize,
     pub context_window_tokens: u64,
     pub auto_approve: bool,
+    pub planning_enabled: bool,
 }
 
 impl Config {
@@ -77,6 +78,7 @@ impl Config {
             max_steps: max_steps.max(1),
             context_window_tokens,
             auto_approve,
+            planning_enabled: true,
         })
     }
 }

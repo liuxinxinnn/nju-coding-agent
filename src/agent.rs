@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::context::ContextManager;
+use crate::context::{ContextManager, ContextUsage};
 use crate::error::{Error, Result};
 use crate::llm::{DeltaHandler, LanguageModel, Message, Role};
 use crate::project::ProjectProfile;
@@ -41,6 +41,12 @@ pub struct AgentState {
     pub messages: Vec<Message>,
     pub workspace_revision: u64,
     pub last_verified_revision: Option<u64>,
+    #[serde(default = "planning_enabled_default")]
+    pub planning_enabled: bool,
+}
+
+const fn planning_enabled_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +113,7 @@ pub struct Agent {
     phase: AgentPhase,
     workspace_revision: u64,
     last_verified_revision: Option<u64>,
+    planning_enabled: bool,
     project: ProjectProfile,
     initial_system_message: Message,
 }
@@ -131,6 +138,7 @@ impl Agent {
             phase: AgentPhase::Done,
             workspace_revision: 0,
             last_verified_revision: None,
+            planning_enabled: true,
             project,
             initial_system_message,
         }
@@ -159,6 +167,19 @@ impl Agent {
         self.last_verified_revision
     }
 
+    pub const fn planning_enabled(&self) -> bool {
+        self.planning_enabled
+    }
+
+    pub fn set_planning_enabled(&mut self, enabled: bool) {
+        self.planning_enabled = enabled;
+    }
+
+    pub fn context_usage(&self) -> ContextUsage {
+        self.context
+            .usage(&self.messages, &self.tools.definitions())
+    }
+
     pub const fn project_profile(&self) -> &ProjectProfile {
         &self.project
     }
@@ -168,6 +189,7 @@ impl Agent {
             messages: self.messages.clone(),
             workspace_revision: self.workspace_revision,
             last_verified_revision: self.last_verified_revision,
+            planning_enabled: self.planning_enabled,
         }
     }
 
@@ -189,6 +211,7 @@ impl Agent {
         self.messages = state.messages;
         self.workspace_revision = state.workspace_revision;
         self.last_verified_revision = state.last_verified_revision;
+        self.planning_enabled = state.planning_enabled;
         self.phase = AgentPhase::Done;
         Ok(())
     }
@@ -207,22 +230,28 @@ impl Agent {
         self.messages.push(Message::user(task));
         let definitions = self.tools.definitions();
         let planning_definitions = planning_tool_definitions(&definitions);
-        let later_phase_tools = definitions
-            .iter()
-            .filter(|definition| !is_planning_tool(&definition.function.name))
-            .map(|definition| definition.function.name.as_str())
-            .collect::<Vec<_>>();
         let mut call_cache = BTreeMap::<ToolCallKey, (usize, String)>::new();
         self.emit(AgentEvent::ProjectDetected {
             kind: self.project.kind.label().to_owned(),
             evidence: self.project.evidence.clone(),
             verification_command: self.project.verification_command.clone(),
         });
-        self.transition_to(AgentPhase::Planning);
-        self.messages.push(Message::system(planning_prompt(
-            &self.project,
-            &later_phase_tools,
-        )));
+        if self.planning_enabled {
+            let later_phase_tools = definitions
+                .iter()
+                .filter(|definition| !is_planning_tool(&definition.function.name))
+                .map(|definition| definition.function.name.as_str())
+                .collect::<Vec<_>>();
+            self.transition_to(AgentPhase::Planning);
+            self.messages.push(Message::system(planning_prompt(
+                &self.project,
+                &later_phase_tools,
+            )));
+        } else {
+            self.transition_to(AgentPhase::Executing);
+            self.messages
+                .push(Message::system(direct_execution_prompt(&self.project)));
+        }
 
         for step in 1..=self.max_steps {
             if self.phase != AgentPhase::Planning && step == self.max_steps.saturating_sub(1) {
@@ -633,6 +662,13 @@ fn execution_prompt(project: &ProjectProfile) -> String {
     )
 }
 
+fn direct_execution_prompt(project: &ProjectProfile) -> String {
+    format!(
+        "Plan mode is disabled for this session. Enter EXECUTE directly: inspect the workspace, make the smallest correct changes, and use file tools rather than shell commands for edits. After any successful write_file or replace_text, the runtime still advances workspace_revision and blocks DONE until a recognized test, build, lint, or program command exits with code 0 for that same revision. {}",
+        project.prompt_hint()
+    )
+}
+
 fn finish_blocked_prompt(
     workspace_revision: u64,
     last_verified_revision: Option<u64>,
@@ -649,7 +685,7 @@ fn system_prompt(workspace: &Path, project: &ProjectProfile) -> String {
     format!(
         "You are a careful coding agent working only inside this workspace: {}\n\
          Every requested file must remain inside that workspace. If the user asks for a path outside it, explain that they must restart the agent with that path as --workspace; never bypass the file sandbox through shell commands. \
-         Follow the runtime-controlled PLAN -> EXECUTE -> VERIFY phases. Inspect relevant files before editing. Always use write_file to create files and replace_text for small edits; never use run_command, shell redirection, or PowerShell file commands to create or edit files. Use run_command only to build, test, lint, or run the resulting project. A command result may be reused while the workspace is unchanged, but the same verification command must run again after a successful file edit. Tool errors \
+         Follow the runtime-selected flow: PLAN -> EXECUTE -> VERIFY when Plan mode is enabled, or EXECUTE -> VERIFY when it is disabled. Inspect relevant files before editing. Always use write_file to create files and replace_text for small edits; never use run_command, shell redirection, or PowerShell file commands to create or edit files. Use run_command only to build, test, lint, or run the resulting project. A command result may be reused while the workspace is unchanged, but the same verification command must run again after a successful file edit. Tool errors \
          are observations: correct the request instead of pretending it succeeded. Never request \
          secrets or bypass the sandbox and command policy. When the task is complete, respond with \
          a concise summary of changes and verification performed. {}",
@@ -1127,6 +1163,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_plan_starts_in_execute_and_still_requires_verification() {
+        let model = Arc::new(MockModel {
+            responses: Mutex::new(VecDeque::from([
+                tool_call(
+                    "call-1",
+                    "replace_text",
+                    r#"{"path":"app.py","old_text":"bad","new_text":"good"}"#,
+                ),
+                Message::assistant("premature completion"),
+                tool_call(
+                    "call-2",
+                    "run_command",
+                    r#"{"command":"python -m unittest"}"#,
+                ),
+                Message::assistant("verified without planning"),
+            ])),
+        });
+        let edit_executions = Arc::new(AtomicUsize::new(0));
+        let command_executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(NamedCountingTool {
+                name: "replace_text",
+                executions: Arc::clone(&edit_executions),
+                output: "replaced 1 occurrence",
+            })
+            .expect("register edit");
+        registry
+            .register(NamedCountingTool {
+                name: "run_command",
+                executions: Arc::clone(&command_executions),
+                output: "exit_code: 0\nstdout:\nOK\nstderr:\n(empty)",
+            })
+            .expect("register command");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&events);
+        let workspace = tempdir().expect("workspace");
+        let mut agent = Agent::new(model, registry, workspace.path(), 6, 128_000);
+        agent.set_planning_enabled(false);
+        agent.on_event(move |event| {
+            captured_events.lock().expect("event lock").push(event);
+        });
+
+        let result = agent.run_turn("fix directly").await.expect("agent run");
+
+        assert_eq!(result, "verified without planning");
+        assert_eq!(edit_executions.load(Ordering::SeqCst), 1);
+        assert_eq!(command_executions.load(Ordering::SeqCst), 1);
+        assert_eq!(agent.last_verified_revision(), Some(1));
+        let events = events.lock().expect("event lock");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            super::AgentEvent::PhaseChanged {
+                phase: super::AgentPhase::Executing
+            }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            super::AgentEvent::PhaseChanged {
+                phase: super::AgentPhase::Planning
+            } | super::AgentEvent::PlanCreated { .. }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            super::AgentEvent::FinishBlocked {
+                workspace_revision: 1,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
     async fn edit_after_a_passed_check_requires_verifying_the_new_revision() {
         let model = Arc::new(MockModel {
             responses: Mutex::new(VecDeque::from([
@@ -1217,12 +1325,14 @@ mod tests {
             ],
             workspace_revision: 3,
             last_verified_revision: Some(3),
+            planning_enabled: false,
         };
 
         agent.restore_state(state).expect("restore state");
 
         assert_eq!(agent.workspace_revision(), 3);
         assert_eq!(agent.last_verified_revision(), Some(3));
+        assert!(!agent.planning_enabled());
         assert_eq!(agent.messages()[1], Message::user("first turn"));
         assert_eq!(agent.messages()[2], Message::assistant("first answer"));
         assert_ne!(
@@ -1236,6 +1346,7 @@ mod tests {
         assert_eq!(agent.messages()[0].role, Role::System);
         assert_eq!(agent.workspace_revision(), 0);
         assert_eq!(agent.last_verified_revision(), None);
+        assert!(!agent.planning_enabled());
     }
 
     #[test]
@@ -1251,6 +1362,7 @@ mod tests {
                 messages: vec![Message::system("system")],
                 workspace_revision: 1,
                 last_verified_revision: Some(2),
+                planning_enabled: true,
             })
             .expect_err("invalid revision must be rejected");
 

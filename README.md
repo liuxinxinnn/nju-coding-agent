@@ -31,6 +31,8 @@ cargo run -- --workspace D:\path\to\project "修复测试失败并运行测试�
 
 不传任务文本时默认进入全屏 TUI。高风险或未知命令会在界面中弹出确认框；演示环境可显式传入 `--yes`。需要简单逐行模式时使用 `--plain`。
 
+Plan 模式默认开启。TUI 中可用 `/plan off` 跳过独立规划阶段，或用 `/plan on` 恢复；启动时传 `--no-plan` 也可默认关闭。关闭 Plan 后流程变为 `EXECUTE → VERIFY`，但最后一次写入必须通过真实命令验证的 runtime invariant 始终开启。
+
 TUI 中的计划和最终回答会随 DeepSeek SSE 增量实时显示；tool call 分片在本地聚合完成后才执行，流式失败且尚未显示文本时自动降级为普通请求。
 
 TUI 快捷键：
@@ -39,7 +41,7 @@ TUI 快捷键：
 - `Up/Down`、`PageUp/PageDown`、`Home/End` 滚动对话。
 - `Ctrl+P/N` 浏览输入历史，`Ctrl+L` 折叠事件栏。
 - `F1` 帮助，`Ctrl+D` 退出。
-- 内置命令：`/new`、`/sessions`、`/switch <id>`、`/delete <id>`、`/help`、`/clear`、`/status`、`/tools`、`/exit`。
+- 内置命令：`/context`、`/plan [on|off]`、`/new`、`/sessions`、`/switch <id>`、`/delete <id>`、`/help`、`/clear`、`/status`、`/tools`、`/exit`。
 
 ## 当前里程碑
 
@@ -61,12 +63,14 @@ TUI 快捷键：
 - [x] 补齐模型响应与工具错误矩阵、严格编辑语义、revision-aware 去重、符号链接逃逸和上下文工具调用原子性测试
 - [x] 建立 Python 单文件、Python 跨文件和 Rust 三组 benchmark，真实模型均经最新版 PEV 修复并通过独立 5/5 验收
 - [x] 使用真实 DeepSeek SSE 验证 94 个增量片段正确聚合，且成功接收 `reasoning_content`
+- [x] 参考 SecAudit 增加 `/context` 图形化用量弹窗，并支持会话级可选 Plan 模式
 
 三组真实模型结果及统一指标见 [benchmarks/RESULTS.md](benchmarks/RESULTS.md)。
 
-## Plan → Execute → Verify
+## 可选 Plan → Execute → Verify
 
-- `PLAN` 只暴露 `read_file`、`list_files` 和 `search_text`；模型必须先输出可执行计划。
+- 默认启用 Plan：`PLAN` 只暴露 `read_file`、`list_files` 和 `search_text`；模型先输出可执行计划。
+- `/plan off` 或 `--no-plan` 跳过独立 `PLAN`，适合明确、简单的任务；设置会随当前会话持久化。
 - 每次成功 `write_file` 或 `replace_text` 都会递增 `workspace_revision`。
 - 只有明确的 test/build/lint/program 命令且真实 `exit_code: 0` 才更新 `last_verified_revision`。
 - 发生过写入时，仅当 `last_verified_revision == workspace_revision` 才允许进入 `DONE`。模型的文本声明不能绕过该约束。
@@ -86,7 +90,7 @@ Agent 优先读取 workspace 根目录中的确定性标志，并把结果注入
 
 ## 多轮会话
 
-TUI 启动时自动恢复当前 workspace 最近使用的会话。每个会话独立保存完整消息历史、workspace、`workspace_revision` 和 `last_verified_revision`，所以切换回来后可以继续原有上下文与验证状态：
+TUI 启动时自动恢复当前 workspace 最近使用的会话。每个会话独立保存完整消息历史、workspace、`workspace_revision`、`last_verified_revision` 和 Plan 开关，所以切换回来后可以继续原有上下文与运行状态：
 
 - `/new`：保存当前会话并新建空会话。
 - `/sessions`：列出当前 workspace 的会话；`*` 表示当前会话。
@@ -104,6 +108,7 @@ Windows 默认保存到 `%LOCALAPPDATA%\nju-coding-agent\sessions`；也可通�
 - 工具输出统一截断，避免大文件或命令输出撑爆上下文。
 - 最新的读取、列表和搜索结果会标记为当前 workspace 的权威证据，提醒模型不得沿用旧会话中的冲突值。
 - 上下文达到配置窗口的 80% 时自动生成本地摘要，并压缩到约 60% 的预算目标。
+- `/context` 打开与 SecAudit 风格一致的图形化弹窗，展示估算总量、100 格网格以及 system/tools/messages/free 明细；这是保守的本地估算，不伪装成服务端精确计费值。
 - 相同非只读命令批准一次后，本次运行中不再重复询问；`--yes` 可自动批准普通命令，但不能绕过危险命令与 workspace 外路径拦截。
 
 详细计划见 [PROJECT_PLAN.md](PROJECT_PLAN.md)。

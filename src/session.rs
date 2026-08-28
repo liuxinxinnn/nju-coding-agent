@@ -50,6 +50,7 @@ pub struct SessionSummary {
     pub updated_at: String,
     pub workspace_revision: u64,
     pub last_verified_revision: Option<u64>,
+    pub planning_enabled: bool,
 }
 
 impl From<&StoredSession> for SessionSummary {
@@ -61,6 +62,7 @@ impl From<&StoredSession> for SessionSummary {
             updated_at: session.updated_at.clone(),
             workspace_revision: session.state.workspace_revision,
             last_verified_revision: session.state.last_verified_revision,
+            planning_enabled: session.state.planning_enabled,
         }
     }
 }
@@ -318,6 +320,7 @@ mod tests {
             messages: vec![Message::system("system"), Message::user("hello")],
             workspace_revision: 2,
             last_verified_revision: Some(2),
+            planning_enabled: false,
         }
     }
 
@@ -380,5 +383,17 @@ mod tests {
 
         assert!(error.to_string().contains("does not match"));
         assert!(store.list().expect("list sessions").is_empty());
+    }
+
+    #[test]
+    fn old_agent_state_defaults_plan_mode_to_enabled() {
+        let state = serde_json::from_value::<AgentState>(serde_json::json!({
+            "messages": [{"role": "system", "content": "system"}],
+            "workspace_revision": 0,
+            "last_verified_revision": null
+        }))
+        .expect("deserialize old state");
+
+        assert!(state.planning_enabled);
     }
 }

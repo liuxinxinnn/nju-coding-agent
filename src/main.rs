@@ -27,6 +27,10 @@ struct Cli {
     #[arg(long)]
     plain: bool,
 
+    /// Start with Plan mode disabled; verification after edits remains mandatory.
+    #[arg(long)]
+    no_plan: bool,
+
     /// Task to execute. If omitted, starts a multi-turn interactive session.
     task: Vec<String>,
 }
@@ -41,7 +45,8 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::from_env(cli.workspace, cli.max_steps, cli.yes)?;
+    let mut config = Config::from_env(cli.workspace, cli.max_steps, cli.yes)?;
+    config.planning_enabled = !cli.no_plan;
 
     if cli.task.is_empty() && !cli.plain {
         return tui::run(config).await;
@@ -65,13 +70,15 @@ fn build_agent(config: &Config) -> Result<Agent> {
         config.model.clone(),
     )?);
     let tools = default_registry(config.workspace.clone(), config.auto_approve)?;
-    Ok(Agent::new(
+    let mut agent = Agent::new(
         model,
         tools,
         &config.workspace,
         config.max_steps,
         config.context_window_tokens,
-    ))
+    );
+    agent.set_planning_enabled(config.planning_enabled);
+    Ok(agent)
 }
 
 async fn run_plain_repl(config: &Config, agent: &mut Agent) -> Result<()> {

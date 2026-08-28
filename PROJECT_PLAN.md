@@ -46,12 +46,13 @@ CLI
 - [已完成] 会话本地持久化以及 `/new`、`/sessions`、`/switch`、`/delete`，切换时恢复消息和 PEV revision 状态。
 - [已完成] OpenAI-compatible SSE 流式文本输出，聚合 tool call 分片并在 TUI 中实时更新、结束时去重。
 - [已完成] 使用真实 DeepSeek SSE 验证多段 content delta、最终聚合一致性和 `reasoning_content`。
-- token 用量和更完整的可读执行轨迹。
+- [已完成] `/context` 图形化弹窗，展示上下文估算总量、网格和 system/tools/messages/free 分项。
 - 可配置 allow/block 命令规则。
 
 ### M3：特色功能
 
 - [已完成] Plan -> Execute -> Verify 状态机：PLAN 只读、修改递增 workspace revision、明确验证命令成功后才允许 DONE。
+- [已完成] Plan 会话级开关与 `--no-plan`；关闭时直接 EXECUTE，但 revision 验证约束保持强制。
 - [已完成] 根据项目类型选择 test/lint/build 验证命令，检测结果注入 PEV，执行仍经过命令策略。
 - 失败后把验证结果送回模型，允许有限次数修复。
 

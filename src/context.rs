@@ -4,8 +4,8 @@ use crate::error::{Error, Result};
 use crate::llm::{Message, Role, ToolDefinition};
 
 pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 128_000;
-const DEFAULT_TRIGGER_PERCENT: u64 = 80;
-const DEFAULT_TARGET_PERCENT: u64 = 60;
+pub const DEFAULT_TRIGGER_PERCENT: u64 = 80;
+pub const DEFAULT_TARGET_PERCENT: u64 = 60;
 const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 const SUMMARY_MAX_CHARS: usize = 8_000;
 const MESSAGE_PREVIEW_MAX_CHARS: usize = 160;
@@ -16,6 +16,9 @@ pub struct ContextUsage {
     pub window_tokens: u64,
     pub used_tokens: u64,
     pub free_tokens: u64,
+    pub system_tokens: u64,
+    pub tool_tokens: u64,
+    pub message_tokens: u64,
 }
 
 impl ContextUsage {
@@ -24,6 +27,18 @@ impl ContextUsage {
             .saturating_mul(100)
             .checked_div(self.window_tokens)
             .unwrap_or(0)
+    }
+
+    pub fn empty(window_tokens: u64) -> Self {
+        let window_tokens = window_tokens.max(1);
+        Self {
+            window_tokens,
+            used_tokens: 0,
+            free_tokens: window_tokens,
+            system_tokens: 0,
+            tool_tokens: 0,
+            message_tokens: 0,
+        }
     }
 }
 
@@ -61,17 +76,31 @@ impl ContextManager {
     }
 
     pub fn usage(&self, messages: &[Message], tools: &[ToolDefinition]) -> ContextUsage {
-        let message_tokens = messages.iter().fold(0_u64, |total, message| {
-            total.saturating_add(estimate_message_tokens(message))
-        });
-        let tool_tokens = serde_json::to_string(tools)
+        let mut system_tokens = 0_u64;
+        let mut tool_tokens = serde_json::to_string(tools)
             .map(|json| estimate_text_tokens(&json))
             .unwrap_or(0);
-        let used_tokens = message_tokens.saturating_add(tool_tokens);
+        let mut message_tokens = 0_u64;
+        for message in messages {
+            let tokens = estimate_message_tokens(message);
+            match message.role {
+                Role::System => system_tokens = system_tokens.saturating_add(tokens),
+                Role::Tool => tool_tokens = tool_tokens.saturating_add(tokens),
+                Role::User | Role::Assistant => {
+                    message_tokens = message_tokens.saturating_add(tokens);
+                }
+            }
+        }
+        let used_tokens = system_tokens
+            .saturating_add(tool_tokens)
+            .saturating_add(message_tokens);
         ContextUsage {
             window_tokens: self.window_tokens,
             used_tokens,
             free_tokens: self.window_tokens.saturating_sub(used_tokens),
+            system_tokens,
+            tool_tokens,
+            message_tokens,
         }
     }
 
@@ -256,7 +285,8 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::ContextManager;
-    use crate::llm::{FunctionCall, Message, Role, ToolCall};
+    use crate::llm::{FunctionCall, Message, Role, ToolCall, ToolDefinition};
+    use serde_json::json;
 
     #[test]
     fn estimates_chinese_more_conservatively_than_ascii() {
@@ -264,6 +294,33 @@ mod tests {
         let ascii = manager.usage(&[Message::user("1234")], &[]);
         let chinese = manager.usage(&[Message::user("测试文本")], &[]);
         assert!(chinese.used_tokens > ascii.used_tokens);
+    }
+
+    #[test]
+    fn usage_breakdown_accounts_for_every_estimated_token() {
+        let manager = ContextManager::new(10_000);
+        let messages = vec![
+            Message::system("system instructions"),
+            Message::user("inspect the project"),
+            Message::assistant("I will inspect it"),
+            Message::tool("call-1", "file contents"),
+        ];
+        let tools = vec![ToolDefinition::function(
+            "read_file".to_owned(),
+            "read one file".to_owned(),
+            json!({"type": "object"}),
+        )];
+
+        let usage = manager.usage(&messages, &tools);
+
+        assert!(usage.system_tokens > 0);
+        assert!(usage.tool_tokens > 0);
+        assert!(usage.message_tokens > 0);
+        assert_eq!(
+            usage.used_tokens,
+            usage.system_tokens + usage.tool_tokens + usage.message_tokens
+        );
+        assert_eq!(usage.free_tokens, usage.window_tokens - usage.used_tokens);
     }
 
     #[test]
