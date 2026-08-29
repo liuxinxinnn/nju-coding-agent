@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
@@ -12,9 +13,10 @@ const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 const CALIBRATION_BASE: u64 = 1_000;
 const MIN_CALIBRATION: u64 = 500;
 const MAX_CALIBRATION: u64 = 4_000;
-const LARGE_TOOL_RESULT_CHARS: usize = 4_000;
-const LARGE_TOOL_PREVIEW_CHARS: usize = 800;
-const OLD_TOOL_PREVIEW_CHARS: usize = 120;
+const LARGE_TOOL_RESULT_CHARS: usize = 1_200;
+const TOOL_RESULT_HEAD_CHARS: usize = 320;
+const TOOL_RESULT_TAIL_CHARS: usize = 320;
+const TOOL_RESULT_SUMMARY_CHARS: usize = 180;
 const SUMMARY_MAX_CHARS: usize = 8_000;
 const MESSAGE_PREVIEW_MAX_CHARS: usize = 160;
 const SMART_SUMMARY_PREFIX: &str = "Earlier conversation summary (model-generated):";
@@ -227,8 +229,8 @@ impl ContextManager {
         let mut stages = Vec::new();
         let mut keep_start = latest_user_turn_start(messages)?;
 
-        if shrink_large_tool_results(messages, keep_start) {
-            stages.push("large-results".to_owned());
+        if compact_large_tool_results(messages, keep_start) {
+            stages.push("tool-result-compaction".to_owned());
             if self.usage(messages, tools).used_tokens <= target_tokens {
                 return Ok(CompressionPreparation::Complete(self.event(
                     messages,
@@ -240,22 +242,9 @@ impl ContextManager {
             }
         }
 
-        if drop_low_value_content(messages, keep_start) {
-            stages.push("low-value-content".to_owned());
+        if prune_history(messages, keep_start) {
+            stages.push("history-pruning".to_owned());
             keep_start = latest_user_turn_start(messages)?;
-            if self.usage(messages, tools).used_tokens <= target_tokens {
-                return Ok(CompressionPreparation::Complete(self.event(
-                    messages,
-                    tools,
-                    keep_start,
-                    before.used_tokens,
-                    stages,
-                )));
-            }
-        }
-
-        if replace_old_tool_results(messages, keep_start) {
-            stages.push("old-tool-placeholders".to_owned());
             if self.usage(messages, tools).used_tokens <= target_tokens {
                 return Ok(CompressionPreparation::Complete(self.event(
                     messages,
@@ -303,11 +292,11 @@ impl ContextManager {
     ) -> Result<CompressionEvent> {
         let source = &messages[1..request.keep_start];
         let (prefix, summary, stage) = match smart_summary.filter(|text| !text.trim().is_empty()) {
-            Some(summary) => (SMART_SUMMARY_PREFIX, summary, "model-summary"),
+            Some(summary) => (SMART_SUMMARY_PREFIX, summary, "semantic-summary"),
             None => (
                 FALLBACK_SUMMARY_PREFIX,
                 summarize_messages(source),
-                "deterministic-summary",
+                "semantic-summary-fallback",
             ),
         };
         request.stages.push(stage.to_owned());
@@ -416,7 +405,13 @@ fn latest_user_turn_start(messages: &[Message]) -> Result<usize> {
         .ok_or_else(|| Error::Agent("context has no compressible user turn".to_owned()))
 }
 
-fn shrink_large_tool_results(messages: &mut [Message], keep_start: usize) -> bool {
+fn compact_large_tool_results(messages: &mut [Message], keep_start: usize) -> bool {
+    let call_names = messages[1..keep_start]
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .map(|call| (call.id.clone(), call.function.name.clone()))
+        .collect::<BTreeMap<_, _>>();
     let mut changed = false;
     for message in &mut messages[1..keep_start] {
         if message.role != Role::Tool {
@@ -429,69 +424,150 @@ fn shrink_large_tool_results(messages: &mut [Message], keep_start: usize) -> boo
         if chars <= LARGE_TOOL_RESULT_CHARS {
             continue;
         }
-        message.content = Some(format!(
-            "{}\n[large tool result compacted locally; original_chars={chars}]",
-            truncate_chars(content, LARGE_TOOL_PREVIEW_CHARS)
-        ));
+        let call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
+        let tool_name = call_names
+            .get(call_id)
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        message.content = Some(compact_tool_result(tool_name, call_id, content));
         changed = true;
     }
     changed
 }
 
-fn drop_low_value_content(messages: &mut Vec<Message>, keep_start: usize) -> bool {
+fn compact_tool_result(tool_name: &str, call_id: &str, content: &str) -> String {
+    let chars = content.chars().count();
+    let exit_code = extract_exit_code(content);
+    let status = if content.starts_with("ERROR:") {
+        "error"
+    } else if exit_code == Some(0) {
+        "success"
+    } else if exit_code.is_some() {
+        "failure"
+    } else {
+        "success"
+    };
+    let summary = summarize_tool_result(content);
+    let head = take_chars(content, TOOL_RESULT_HEAD_CHARS);
+    let tail = tail_chars(content, TOOL_RESULT_TAIL_CHARS);
+    format!(
+        "[compacted tool result]\n\
+         tool: {tool_name}\n\
+         call_id: {call_id}\n\
+         status: {status}\n\
+         exit_code: {}\n\
+         original_chars: {chars}\n\
+         summary: {summary}\n\
+         head:\n{head}\n\
+         tail:\n{tail}",
+        exit_code.map_or_else(|| "n/a".to_owned(), |code| code.to_string())
+    )
+}
+
+fn extract_exit_code(content: &str) -> Option<i32> {
+    content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("exit_code:")
+            .or_else(|| line.trim().strip_prefix("exit code:"))
+            .and_then(|value| value.trim().parse::<i32>().ok())
+    })
+}
+
+fn summarize_tool_result(content: &str) -> String {
+    let summary = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !matches!(*line, "stdout:" | "stderr:")
+                && !line.starts_with("exit_code:")
+                && !line.starts_with("RUNTIME:")
+        })
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    truncate_chars(&summary, TOOL_RESULT_SUMMARY_CHARS)
+}
+
+fn take_chars(content: &str, count: usize) -> String {
+    content.chars().take(count).collect()
+}
+
+fn tail_chars(content: &str, count: usize) -> String {
+    let mut tail = content.chars().rev().take(count).collect::<Vec<_>>();
+    tail.reverse();
+    tail.into_iter().collect()
+}
+
+fn prune_history(messages: &mut Vec<Message>, keep_start: usize) -> bool {
+    let duplicate_call_ids = messages[1..keep_start]
+        .iter()
+        .filter(|message| {
+            message.role == Role::Tool
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("Duplicate tool call skipped"))
+        })
+        .filter_map(|message| message.tool_call_id.clone())
+        .collect::<BTreeSet<_>>();
+
     let mut changed = false;
-    for message in &mut messages[1..keep_start] {
-        if message.reasoning_content.take().is_some() {
-            changed = true;
+    let original = std::mem::take(messages);
+    let mut pruned = Vec::with_capacity(original.len());
+    for (index, mut message) in original.into_iter().enumerate() {
+        if index == 0 || index >= keep_start {
+            pruned.push(message);
+            continue;
         }
-        if message.role == Role::Assistant
-            && message
-                .tool_calls
-                .as_ref()
-                .is_some_and(|calls| !calls.is_empty())
-            && message.content.take().is_some()
-        {
-            changed = true;
-        }
-    }
-    let mut index = 1;
-    let mut boundary = keep_start.min(messages.len());
-    while index < boundary {
-        if messages[index].role == Role::System
-            && !messages[index]
+        if message.role == Role::System
+            && !message
                 .content
                 .as_deref()
                 .is_some_and(|content| content.starts_with("Earlier conversation summary"))
         {
-            messages.remove(index);
-            boundary = boundary.saturating_sub(1);
             changed = true;
-        } else {
-            index += 1;
+            continue;
         }
+        if message.role == Role::Tool
+            && message
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| duplicate_call_ids.contains(id))
+        {
+            changed = true;
+            continue;
+        }
+        if message.reasoning_content.take().is_some() {
+            changed = true;
+        }
+        if message.role == Role::Assistant {
+            let had_calls = message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty());
+            if let Some(calls) = &mut message.tool_calls {
+                let before = calls.len();
+                calls.retain(|call| !duplicate_call_ids.contains(&call.id));
+                changed |= calls.len() != before;
+                if calls.is_empty() {
+                    message.tool_calls = None;
+                }
+            }
+            if had_calls && message.content.take().is_some() {
+                changed = true;
+            }
+            if message.content.is_none()
+                && message.reasoning_content.is_none()
+                && message.tool_calls.is_none()
+            {
+                changed = true;
+                continue;
+            }
+        }
+        pruned.push(message);
     }
-    changed
-}
-
-fn replace_old_tool_results(messages: &mut [Message], keep_start: usize) -> bool {
-    let mut changed = false;
-    for message in &mut messages[1..keep_start] {
-        if message.role != Role::Tool {
-            continue;
-        }
-        let Some(content) = message.content.as_deref() else {
-            continue;
-        };
-        let chars = content.chars().count();
-        if chars <= OLD_TOOL_PREVIEW_CHARS {
-            continue;
-        }
-        let call_id = message.tool_call_id.as_deref().unwrap_or("unknown");
-        message.content = Some(format!(
-            "[old tool result omitted; call_id={call_id}; original_chars={chars}]"
-        ));
-        changed = true;
-    }
+    *messages = pruned;
     changed
 }
 
@@ -685,13 +761,19 @@ mod tests {
     }
 
     #[test]
-    fn cheap_stages_shrink_large_old_tool_results_before_summary() {
-        let manager = ContextManager::with_policy(700, 40, 30);
+    fn stage_one_keeps_structured_evidence_from_large_tool_results() {
+        let manager = ContextManager::with_policy(4_000, 30, 25);
         let mut messages = vec![
             Message::system("system"),
             Message::user("old request"),
-            tool_call_message("old-call"),
-            Message::tool("old-call", "large result ".repeat(500)),
+            named_tool_call_message("old-call", "run_command", r#"{"command":"cargo test"}"#),
+            Message::tool(
+                "old-call",
+                format!(
+                    "exit_code: 0\nstdout:\nHEAD_MARKER\n{}\nTAIL_MARKER\nstderr:\n(empty)",
+                    "test output ".repeat(500)
+                ),
+            ),
             Message::assistant("old conclusion"),
             Message::user("latest request"),
             Message::assistant("latest progress"),
@@ -701,7 +783,7 @@ mod tests {
             .expect("preparation");
         match preparation {
             CompressionPreparation::Complete(event) => {
-                assert!(event.stages.contains(&"large-results".to_owned()));
+                assert!(event.stages.contains(&"tool-result-compaction".to_owned()));
                 assert!(event.after_tokens < event.before_tokens);
             }
             CompressionPreparation::NeedsSummary(request) => {
@@ -713,14 +795,63 @@ mod tests {
                         Some("smart summary".to_owned()),
                     )
                     .expect("summary");
-                assert!(event.stages.contains(&"large-results".to_owned()));
-                assert!(event.stages.contains(&"model-summary".to_owned()));
+                assert!(event.stages.contains(&"tool-result-compaction".to_owned()));
+                assert!(event.stages.contains(&"semantic-summary".to_owned()));
             }
             CompressionPreparation::None => panic!("expected compaction"),
         }
+        let compacted = messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("old-call"))
+            .and_then(|message| message.content.as_deref())
+            .expect("compacted tool result retained");
+        assert!(compacted.contains("tool: run_command"));
+        assert!(compacted.contains("status: success"));
+        assert!(compacted.contains("exit_code: 0"));
+        assert!(compacted.contains("head:\nexit_code: 0"));
+        assert!(compacted.contains("TAIL_MARKER"));
         assert!(messages.iter().any(|message| {
             message.role == Role::User && message.content.as_deref() == Some("latest request")
         }));
+    }
+
+    #[test]
+    fn stage_two_removes_duplicate_call_and_result_as_an_atomic_pair() {
+        let manager = ContextManager::with_policy(1_000, 30, 25);
+        let mut messages = vec![
+            Message::system("system"),
+            Message::user("old request"),
+            Message::system("temporary state ".repeat(200)),
+            named_tool_call_message("duplicate-call", "read_file", r#"{"path":"a.rs"}"#),
+            Message::tool(
+                "duplicate-call",
+                "Duplicate tool call skipped to avoid repeating side effects.",
+            ),
+            Message::assistant("old conclusion"),
+            Message::user("latest request"),
+            Message::assistant("latest progress"),
+        ];
+
+        let event = match manager
+            .prepare_compaction(&mut messages, &[])
+            .expect("preparation")
+        {
+            CompressionPreparation::Complete(event) => event,
+            other => panic!("expected deterministic pruning, got {other:?}"),
+        };
+
+        assert!(event.stages.contains(&"history-pruning".to_owned()));
+        assert!(!messages.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == "duplicate-call"))
+        }));
+        assert!(
+            !messages
+                .iter()
+                .any(|message| { message.tool_call_id.as_deref() == Some("duplicate-call") })
+        );
     }
 
     #[test]
@@ -742,9 +873,14 @@ mod tests {
             CompressionPreparation::NeedsSummary(request) => request,
             other => panic!("expected summary request, got {other:?}"),
         };
-        manager
+        let event = manager
             .finish_summary(&mut messages, &[], request, None)
             .expect("compression");
+        assert!(
+            event
+                .stages
+                .contains(&"semantic-summary-fallback".to_owned())
+        );
         let retained_call = messages.iter().any(|message| {
             message
                 .tool_calls
@@ -794,6 +930,10 @@ mod tests {
     }
 
     fn tool_call_message(id: &str) -> Message {
+        named_tool_call_message(id, "read_file", r#"{"path":"src/main.rs"}"#)
+    }
+
+    fn named_tool_call_message(id: &str, name: &str, arguments: &str) -> Message {
         Message {
             role: Role::Assistant,
             content: None,
@@ -802,8 +942,8 @@ mod tests {
                 id: id.to_owned(),
                 kind: "function".to_owned(),
                 function: FunctionCall {
-                    name: "read_file".to_owned(),
-                    arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
+                    name: name.to_owned(),
+                    arguments: arguments.to_owned(),
                 },
             }]),
             tool_call_id: None,

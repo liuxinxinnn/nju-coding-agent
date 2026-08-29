@@ -43,7 +43,7 @@ CLI
 ### M2：上下文与体验
 
 - [已完成] 基于字符估算的上下文预算，中文按更保守的每字符一 token 计算；用 API 真实 prompt usage 平滑校准后续估算。
-- [已完成] 超过 80% 自动执行 cheap-first 四层压缩：大结果、低价值内容、旧结果占位、模型摘要/本地兜底；保留 system prompt、最近完整用户轮次和工具调用链。
+- [已完成] 超过 80% 自动执行 cheap-first 三阶段压缩：结构化 Tool Result Compaction、原子安全的 History Pruning、Semantic Summary/本地兜底；保留 system prompt、最近完整用户轮次和工具调用链。
 - [已完成] 会话本地持久化以及 `/new`、`/sessions`、`/switch`、`/delete`，切换时恢复消息和 PEV revision 状态。
 - [已完成] OpenAI-compatible SSE 流式文本输出，聚合 tool call 分片并在 TUI 中实时更新、结束时去重。
 - [已完成] 使用真实 DeepSeek SSE 验证多段 content delta、最终聚合一致性和 `reasoning_content`。
