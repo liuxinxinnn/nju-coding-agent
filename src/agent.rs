@@ -253,6 +253,9 @@ impl Agent {
             return Err(Error::Agent("task cannot be empty".to_owned()));
         }
         self.messages.push(Message::user(task));
+        let memory_required = is_explicit_memory_request(task);
+        let memory_query = is_memory_query(task);
+        let mut memory_persisted = false;
         let definitions = self.tools.definitions();
         let planning_definitions = planning_tool_definitions(&definitions);
         let mut call_cache = BTreeMap::<ToolCallKey, (usize, String)>::new();
@@ -261,7 +264,7 @@ impl Agent {
             evidence: self.project.evidence.clone(),
             verification_command: self.project.verification_command.clone(),
         });
-        if self.planning_enabled {
+        if self.planning_enabled && !memory_required && !memory_query {
             let later_phase_tools = definitions
                 .iter()
                 .filter(|definition| !is_planning_tool(&definition.function.name))
@@ -274,8 +277,13 @@ impl Agent {
             )));
         } else {
             self.transition_to(AgentPhase::Executing);
-            self.messages
-                .push(Message::system(direct_execution_prompt(&self.project)));
+            self.messages.push(Message::system(if memory_required {
+                memory_execution_prompt(&self.project)
+            } else if memory_query {
+                memory_query_prompt()
+            } else {
+                direct_execution_prompt(&self.project)
+            }));
         }
 
         for step in 1..=self.max_steps {
@@ -332,6 +340,12 @@ impl Agent {
                     self.transition_to(AgentPhase::Executing);
                     self.messages
                         .push(Message::system(execution_prompt(&self.project)));
+                    continue;
+                }
+                if memory_required && !memory_persisted {
+                    self.messages.push(Message::system(
+                        "Runtime invariant blocked DONE: the user explicitly asked you to remember durable information, but no memory tool call has succeeded in this turn. Enter EXECUTE and call memory now. A textual acknowledgement such as 'I will remember' is not persistence. Use target=user for personal language/style/operation preferences and target=project for project facts or architecture rules.",
+                    ));
                     continue;
                 }
                 if self.can_finish() {
@@ -412,6 +426,9 @@ impl Agent {
                     .tools
                     .execute(&call.function.name, &call.function.arguments)
                     .await;
+                if call.function.name == "memory" && !raw_observation.starts_with("ERROR:") {
+                    memory_persisted = true;
+                }
                 self.emit(AgentEvent::ToolResult {
                     name: call.function.name.clone(),
                     result: raw_observation.clone(),
@@ -753,6 +770,40 @@ fn direct_execution_prompt(project: &ProjectProfile) -> String {
     )
 }
 
+fn memory_execution_prompt(project: &ProjectProfile) -> String {
+    format!(
+        "This is an explicit durable-memory request, so skip PLAN and enter EXECUTE directly. You must call the memory tool with target=user for personal language/style/operation preferences or target=project for project facts and architecture rules. Do not merely acknowledge the request: DONE is blocked until a memory call succeeds. Do not inspect or modify workspace files for this task. {}",
+        project.prompt_hint()
+    )
+}
+
+fn memory_query_prompt() -> String {
+    "This is a memory-recall question, not a coding change. Skip PLAN and answer directly from the Local long-term memory section and the current conversation. Do not inspect workspace files to look for USER.md or MEMORY.md because those files live in local application data and their current contents are already supplied in the system prompt."
+        .to_owned()
+}
+
+fn is_explicit_memory_request(task: &str) -> bool {
+    let normalized = task.trim().to_lowercase();
+    normalized.starts_with("记住")
+        || normalized.contains("请记住")
+        || normalized.contains("帮我记住")
+        || normalized.contains("以后默认")
+        || normalized.contains("从今以后")
+        || normalized.starts_with("remember ")
+        || normalized.starts_with("remember:")
+        || normalized.starts_with("remember：")
+        || normalized.contains("please remember")
+}
+
+fn is_memory_query(task: &str) -> bool {
+    let normalized = task.trim().to_lowercase();
+    normalized.contains("你记得")
+        || normalized.contains("还记得")
+        || normalized.contains("记得我的")
+        || normalized.contains("do you remember")
+        || normalized.contains("what do you remember")
+}
+
 fn finish_blocked_prompt(
     workspace_revision: u64,
     last_verified_revision: Option<u64>,
@@ -810,7 +861,7 @@ mod tests {
     use crate::project::ProjectProfile;
     use crate::tool::{Tool, ToolRegistry};
 
-    use super::{Agent, AgentState};
+    use super::{Agent, AgentState, is_explicit_memory_request, is_memory_query};
 
     struct MockModel {
         responses: Mutex<VecDeque<Message>>,
@@ -997,6 +1048,94 @@ mod tests {
                 .iter()
                 .any(|message| message.role == Role::Tool)
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_memory_request_skips_plan_and_cannot_finish_before_persistence() {
+        let model = Arc::new(MockModel {
+            responses: Mutex::new(VecDeque::from([
+                Message::assistant("我会记住。"),
+                tool_call(
+                    "memory-1",
+                    "memory",
+                    r#"{"target":"user","action":"append","content":"默认使用中文回答"}"#,
+                ),
+                Message::assistant("已写入 USER.md。"),
+            ])),
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(NamedCountingTool {
+                name: "memory",
+                executions: Arc::clone(&executions),
+                output: "updated USER.md locally",
+            })
+            .expect("memory tool");
+        let workspace = tempdir().expect("workspace");
+        let mut agent = Agent::new(model, registry, workspace.path(), 5, 128_000);
+
+        let result = agent
+            .run_turn("记住：以后默认使用中文回答")
+            .await
+            .expect("memory turn");
+
+        assert_eq!(result, "已写入 USER.md。");
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert!(agent.messages().iter().any(|message| {
+            message.role == Role::System
+                && message.content.as_deref().is_some_and(|content| {
+                    content.contains("explicit durable-memory request")
+                        && content.contains("skip PLAN")
+                })
+        }));
+        assert!(agent.messages().iter().any(|message| {
+            message.role == Role::System
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("no memory tool call has succeeded"))
+        }));
+    }
+
+    #[test]
+    fn distinguishes_explicit_memory_commands_from_memory_questions() {
+        assert!(is_explicit_memory_request("请记住以后默认用中文"));
+        assert!(is_explicit_memory_request(
+            "Please remember my test preference"
+        ));
+        assert!(!is_explicit_memory_request("你记得我的语言偏好吗？"));
+        assert!(is_memory_query("你记得我的语言偏好吗？"));
+        assert!(!is_memory_query("记住：默认使用中文"));
+    }
+
+    #[tokio::test]
+    async fn memory_question_skips_plan_and_workspace_inspection() {
+        let model = Arc::new(MockModel {
+            responses: Mutex::new(VecDeque::from([Message::assistant("记得：默认使用中文。")])),
+        });
+        let workspace = tempdir().expect("workspace");
+        let mut agent = Agent::new(model, ToolRegistry::new(), workspace.path(), 3, 128_000);
+
+        let result = agent
+            .run_turn("你记得我的语言偏好吗？")
+            .await
+            .expect("memory query");
+
+        assert_eq!(result, "记得：默认使用中文。");
+        assert!(agent.messages().iter().any(|message| {
+            message.role == Role::System
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("memory-recall question"))
+        }));
+        assert!(!agent.messages().iter().any(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.starts_with("PLAN phase"))
+        }));
     }
 
     #[tokio::test]
