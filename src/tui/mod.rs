@@ -115,6 +115,7 @@ struct App {
     chat_scroll: u16,
     follow_chat: bool,
     chat_height: u16,
+    input_width: usize,
     pending_confirmation: Option<PendingConfirmation>,
     streaming_index: Option<usize>,
     streaming_phase: Option<AgentPhase>,
@@ -152,6 +153,7 @@ impl App {
             chat_scroll: 0,
             follow_chat: true,
             chat_height: 10,
+            input_width: 1,
             pending_confirmation: None,
             streaming_index: None,
             streaming_phase: None,
@@ -1020,8 +1022,8 @@ fn handle_key(app: &mut App, key: KeyEvent, command_tx: &mpsc::UnboundedSender<W
         KeyCode::Down if app.input.is_empty() => {
             app.chat_scroll = app.chat_scroll.saturating_add(1);
         }
-        KeyCode::Up => app.input.move_up(),
-        KeyCode::Down => app.input.move_down(),
+        KeyCode::Up => app.input.move_up(app.input_width),
+        KeyCode::Down => app.input.move_down(app.input_width),
         KeyCode::PageUp => {
             app.follow_chat = false;
             app.chat_scroll = app.chat_scroll.saturating_sub(app.chat_height.max(1));
@@ -1136,8 +1138,16 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         frame.render_widget(events, areas.events);
     }
 
-    let input_scroll = u16::try_from(app.input.cursor_line.saturating_sub(2)).unwrap_or(u16::MAX);
-    let input = Paragraph::new(app.input.visual_lines())
+    app.input_width = usize::from(areas.input.width.saturating_sub(2).max(1));
+    let input_view = app.input.visual(app.input_width);
+    let input_height = usize::from(areas.input.height.saturating_sub(2).max(1));
+    let input_scroll = u16::try_from(
+        input_view
+            .cursor_row
+            .saturating_sub(input_height.saturating_sub(1)),
+    )
+    .unwrap_or(u16::MAX);
+    let input = Paragraph::new(input_view.lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -1175,12 +1185,11 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(footer, areas.footer);
 
     if app.pending_confirmation.is_none() && !app.show_help && !app.show_context {
-        let visible_line = app.input.cursor_line.saturating_sub(input_scroll as usize);
-        let x = areas
-            .input
-            .x
-            .saturating_add(1)
-            .saturating_add(u16::try_from(app.input.cursor_display_col()).unwrap_or(u16::MAX));
+        let visible_line = input_view.cursor_row.saturating_sub(input_scroll as usize);
+        let x = areas.input.x.saturating_add(1).saturating_add(
+            u16::try_from(input_view.cursor_col.min(app.input_width.saturating_sub(1)))
+                .unwrap_or(u16::MAX),
+        );
         let y = areas
             .input
             .y
@@ -1438,5 +1447,30 @@ mod tests {
                 });
         assert!(rendered.contains("LATEST_USER_BODY"));
         assert!(app.chat_scroll > 0, "wrapped rows must require scrolling");
+    }
+
+    #[test]
+    fn long_input_soft_wraps_and_keeps_its_tail_visible() {
+        let mut app = App::new(PathBuf::from("workspace"), "model".to_owned());
+        app.input
+            .set_text(&format!("{}INPUT_TAIL", "long input words ".repeat(30)));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw TUI");
+
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(rendered.contains("INPUT_TAIL"));
     }
 }

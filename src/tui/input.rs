@@ -1,6 +1,6 @@
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MAX_INPUT_LINES: usize = 6;
 const INPUT_PLACEHOLDER: &str = "输入编程任务...";
@@ -10,6 +10,19 @@ pub(super) struct InputBuffer {
     lines: Vec<String>,
     pub(super) cursor_line: usize,
     cursor_col: usize,
+}
+
+pub(super) struct InputView {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) cursor_row: usize,
+    pub(super) cursor_col: usize,
+}
+
+struct VisualSegment {
+    logical_line: usize,
+    start_char: usize,
+    end_char: usize,
+    text: String,
 }
 
 impl InputBuffer {
@@ -102,19 +115,21 @@ impl InputBuffer {
         }
     }
 
-    pub(super) fn move_up(&mut self) {
+    pub(super) fn move_up(&mut self, width: usize) {
         self.ensure_invariants();
-        if self.cursor_line > 0 {
-            self.cursor_line -= 1;
-            self.cursor_col = self.cursor_col.min(self.current_line_len());
+        let segments = self.visual_segments(width);
+        let (row, display_col) = self.visual_cursor(&segments);
+        if row > 0 {
+            self.move_to_visual_segment(&segments[row - 1], display_col);
         }
     }
 
-    pub(super) fn move_down(&mut self) {
+    pub(super) fn move_down(&mut self, width: usize) {
         self.ensure_invariants();
-        if self.cursor_line + 1 < self.lines.len() {
-            self.cursor_line += 1;
-            self.cursor_col = self.cursor_col.min(self.current_line_len());
+        let segments = self.visual_segments(width);
+        let (row, display_col) = self.visual_cursor(&segments);
+        if let Some(segment) = segments.get(row + 1) {
+            self.move_to_visual_segment(segment, display_col);
         }
     }
 
@@ -127,25 +142,24 @@ impl InputBuffer {
         self.cursor_col = self.current_line_len();
     }
 
-    pub(super) fn cursor_display_col(&self) -> usize {
-        let Some(line) = self.lines.get(self.cursor_line) else {
-            return 0;
-        };
-        let byte = char_to_byte_idx(line, self.cursor_col);
-        line.get(..byte).map_or(0, UnicodeWidthStr::width)
-    }
-
-    pub(super) fn visual_lines(&self) -> Vec<Line<'_>> {
-        if self.lines.iter().all(String::is_empty) {
-            return vec![Line::from(Span::styled(
+    pub(super) fn visual(&self, width: usize) -> InputView {
+        let segments = self.visual_segments(width);
+        let (cursor_row, cursor_col) = self.visual_cursor(&segments);
+        let mut lines = segments
+            .into_iter()
+            .map(|segment| Line::from(segment.text))
+            .collect::<Vec<_>>();
+        if self.is_empty() {
+            lines[0] = Line::from(Span::styled(
                 INPUT_PLACEHOLDER,
                 Style::default().fg(Color::DarkGray),
-            ))];
+            ));
         }
-        self.lines
-            .iter()
-            .map(|line| Line::from(line.as_str()))
-            .collect()
+        InputView {
+            lines,
+            cursor_row,
+            cursor_col,
+        }
     }
 
     fn current_line_len(&self) -> usize {
@@ -160,6 +174,101 @@ impl InputBuffer {
         }
         self.cursor_line = self.cursor_line.min(self.lines.len().saturating_sub(1));
         self.cursor_col = self.cursor_col.min(self.current_line_len());
+    }
+
+    fn visual_segments(&self, width: usize) -> Vec<VisualSegment> {
+        let width = width.max(1);
+        let mut segments = Vec::new();
+        for (logical_line, line) in self.lines.iter().enumerate() {
+            let mut text = String::new();
+            let mut display_width = 0_usize;
+            let mut start_char = 0;
+            let mut end_char = 0;
+            for (char_index, character) in line.chars().enumerate() {
+                let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+                if !text.is_empty() && display_width.saturating_add(char_width) > width {
+                    segments.push(VisualSegment {
+                        logical_line,
+                        start_char,
+                        end_char: char_index,
+                        text: std::mem::take(&mut text),
+                    });
+                    start_char = char_index;
+                    display_width = 0;
+                }
+                text.push(character);
+                display_width = display_width.saturating_add(char_width);
+                end_char = char_index + 1;
+                if display_width >= width {
+                    segments.push(VisualSegment {
+                        logical_line,
+                        start_char,
+                        end_char,
+                        text: std::mem::take(&mut text),
+                    });
+                    start_char = end_char;
+                    display_width = 0;
+                }
+            }
+            let needs_cursor_row = logical_line == self.cursor_line
+                && self.cursor_col == end_char
+                && start_char == end_char;
+            if !text.is_empty() || line.is_empty() || needs_cursor_row {
+                segments.push(VisualSegment {
+                    logical_line,
+                    start_char,
+                    end_char,
+                    text,
+                });
+            }
+        }
+        if segments.is_empty() {
+            segments.push(VisualSegment {
+                logical_line: 0,
+                start_char: 0,
+                end_char: 0,
+                text: String::new(),
+            });
+        }
+        segments
+    }
+
+    fn visual_cursor(&self, segments: &[VisualSegment]) -> (usize, usize) {
+        for (row, segment) in segments.iter().enumerate() {
+            if segment.logical_line != self.cursor_line {
+                continue;
+            }
+            let is_last_for_line = segments
+                .get(row + 1)
+                .is_none_or(|next| next.logical_line != segment.logical_line);
+            let contains_cursor = (self.cursor_col >= segment.start_char
+                && self.cursor_col < segment.end_char)
+                || (segment.start_char == segment.end_char
+                    && self.cursor_col == segment.start_char)
+                || (is_last_for_line && self.cursor_col == segment.end_char);
+            if contains_cursor {
+                let characters = self.cursor_col.saturating_sub(segment.start_char);
+                let byte = char_to_byte_idx(&segment.text, characters);
+                let display_col = segment.text.get(..byte).map_or(0, UnicodeWidthStr::width);
+                return (row, display_col);
+            }
+        }
+        (segments.len().saturating_sub(1), 0)
+    }
+
+    fn move_to_visual_segment(&mut self, segment: &VisualSegment, display_col: usize) {
+        self.cursor_line = segment.logical_line;
+        let mut width = 0_usize;
+        let mut characters = 0;
+        for character in segment.text.chars() {
+            let next = width.saturating_add(UnicodeWidthChar::width(character).unwrap_or(0));
+            if next > display_col {
+                break;
+            }
+            width = next;
+            characters += 1;
+        }
+        self.cursor_col = segment.start_char.saturating_add(characters);
     }
 }
 
@@ -232,5 +341,47 @@ mod tests {
         assert_eq!(input.text(), "你很好");
         input.backspace();
         assert_eq!(input.text(), "你好");
+    }
+
+    #[test]
+    fn soft_wraps_without_changing_submitted_text_or_cursor() {
+        let mut input = InputBuffer::new();
+        input.set_text("123456你好abcdef");
+
+        let view = input.visual(8);
+        let rendered = view
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(rendered, input.text());
+        assert!(view.lines.len() >= 2);
+        assert_eq!(view.cursor_row, view.lines.len() - 1);
+        assert!(view.cursor_col < 8);
+    }
+
+    #[test]
+    fn up_and_down_move_between_soft_wrapped_rows() {
+        let mut input = InputBuffer::new();
+        input.set_text("abcdefghijklmnopqrst");
+        assert_eq!(input.visual(6).cursor_row, 3);
+
+        input.move_up(6);
+        assert_eq!(input.visual(6).cursor_row, 2);
+        input.move_down(6);
+        assert_eq!(input.visual(6).cursor_row, 3);
+    }
+
+    #[test]
+    fn exact_width_manual_line_does_not_add_a_blank_visual_row() {
+        let mut input = InputBuffer::new();
+        input.set_text("abcdef\nnext");
+
+        let view = input.visual(6);
+
+        assert_eq!(view.lines.len(), 2);
+        assert_eq!(view.cursor_row, 1);
     }
 }
