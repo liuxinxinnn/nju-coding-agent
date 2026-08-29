@@ -12,6 +12,28 @@ mod stream;
 
 use stream::{SseDecoder, StreamAccumulator};
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelResponse {
+    pub message: Message,
+    pub usage: Option<TokenUsage>,
+}
+
+impl From<Message> for ModelResponse {
+    fn from(message: Message) -> Self {
+        Self {
+            message,
+            usage: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Message {
     pub role: Role,
@@ -111,19 +133,28 @@ impl ToolDefinition {
 
 #[async_trait]
 pub trait LanguageModel: Send + Sync {
-    async fn complete(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<Message>;
+    async fn complete(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> Result<ModelResponse>;
 
     async fn complete_stream(
         &self,
         messages: &[Message],
         tools: &[ToolDefinition],
         on_delta: DeltaHandler,
-    ) -> Result<Message> {
-        let message = self.complete(messages, tools).await?;
-        if let Some(content) = message.content.as_deref().filter(|text| !text.is_empty()) {
+    ) -> Result<ModelResponse> {
+        let response = self.complete(messages, tools).await?;
+        if let Some(content) = response
+            .message
+            .content
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
             on_delta(content);
         }
-        Ok(message)
+        Ok(response)
     }
 }
 
@@ -159,12 +190,17 @@ impl HttpLanguageModel {
         messages: &[Message],
         tools: &[ToolDefinition],
         on_delta: &DeltaHandler,
-    ) -> Result<Message> {
-        let message = <Self as LanguageModel>::complete(self, messages, tools).await?;
-        if let Some(content) = message.content.as_deref().filter(|text| !text.is_empty()) {
+    ) -> Result<ModelResponse> {
+        let response = <Self as LanguageModel>::complete(self, messages, tools).await?;
+        if let Some(content) = response
+            .message
+            .content
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
             on_delta(content);
         }
-        Ok(message)
+        Ok(response)
     }
 }
 
@@ -179,6 +215,13 @@ struct ChatRequest<'a> {
     reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -190,6 +233,7 @@ struct ThinkingConfig {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    usage: Option<TokenUsage>,
 }
 
 #[derive(Deserialize)]
@@ -209,7 +253,11 @@ struct ApiError {
 
 #[async_trait]
 impl LanguageModel for HttpLanguageModel {
-    async fn complete(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<Message> {
+    async fn complete(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> Result<ModelResponse> {
         let response = self
             .client
             .post(&self.endpoint)
@@ -223,6 +271,7 @@ impl LanguageModel for HttpLanguageModel {
                     .then_some(ThinkingConfig { kind: "enabled" }),
                 reasoning_effort: self.deepseek_thinking.then_some("high"),
                 stream: None,
+                stream_options: None,
             })
             .send()
             .await
@@ -251,7 +300,7 @@ impl LanguageModel for HttpLanguageModel {
         messages: &[Message],
         tools: &[ToolDefinition],
         on_delta: DeltaHandler,
-    ) -> Result<Message> {
+    ) -> Result<ModelResponse> {
         let response = match self
             .client
             .post(&self.endpoint)
@@ -265,6 +314,9 @@ impl LanguageModel for HttpLanguageModel {
                     .then_some(ThinkingConfig { kind: "enabled" }),
                 reasoning_effort: self.deepseek_thinking.then_some("high"),
                 stream: Some(true),
+                stream_options: Some(StreamOptions {
+                    include_usage: true,
+                }),
             })
             .send()
             .await
@@ -383,15 +435,19 @@ impl LanguageModel for HttpLanguageModel {
     }
 }
 
-fn parse_chat_response(body: &str) -> Result<Message> {
+fn parse_chat_response(body: &str) -> Result<ModelResponse> {
     let mut payload: ChatResponse = serde_json::from_str(body)
         .map_err(|error| Error::Llm(format!("invalid response JSON: {error}")))?;
-    payload
+    let message = payload
         .choices
         .drain(..)
         .next()
         .map(|choice| choice.message)
-        .ok_or_else(|| Error::Llm("response contained no choices".to_owned()))
+        .ok_or_else(|| Error::Llm("response contained no choices".to_owned()))?;
+    Ok(ModelResponse {
+        message,
+        usage: payload.usage,
+    })
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
@@ -434,10 +490,11 @@ mod tests {
     #[test]
     fn parses_plain_text_and_rejects_malformed_or_empty_responses() {
         let plain = parse_chat_response(
-            r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}"#,
         )
         .expect("plain response");
-        assert_eq!(plain.content.as_deref(), Some("hello"));
+        assert_eq!(plain.message.content.as_deref(), Some("hello"));
+        assert_eq!(plain.usage.expect("usage").total_tokens, 13);
         assert!(parse_chat_response(r#"{"choices":[]}"#).is_err());
         assert!(parse_chat_response(r#"{"unexpected":true}"#).is_err());
         assert!(parse_chat_response("not json").is_err());
@@ -449,14 +506,14 @@ mod tests {
             r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.py\"}"}}]}}]}"#,
         )
         .expect("one tool call");
-        assert_eq!(one.tool_calls.expect("call").len(), 1);
+        assert_eq!(one.message.tool_calls.expect("call").len(), 1);
 
         let mixed = parse_chat_response(
             r#"{"choices":[{"message":{"role":"assistant","content":"working","tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{}"}},{"id":"call-2","type":"function","function":{"name":"list_files","arguments":"{}"}}]}}]}"#,
         )
         .expect("mixed response");
-        assert_eq!(mixed.content.as_deref(), Some("working"));
-        assert_eq!(mixed.tool_calls.expect("calls").len(), 2);
+        assert_eq!(mixed.message.content.as_deref(), Some("working"));
+        assert_eq!(mixed.message.tool_calls.expect("calls").len(), 2);
     }
 
     #[tokio::test]
@@ -477,6 +534,7 @@ mod tests {
                 "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}}\n\n",
                 "data: [DONE]\n\n"
             );
             write!(
@@ -506,8 +564,10 @@ mod tests {
         server.join().expect("server thread");
         let request = request_rx.recv().expect("captured request");
         assert!(request.contains("\"stream\":true"));
+        assert!(request.contains("\"stream_options\":{\"include_usage\":true}"));
         assert_eq!(streamed.lock().expect("stream lock").as_str(), "Hello");
-        assert_eq!(message.content.as_deref(), Some("Hello"));
-        assert!(message.tool_calls.is_none());
+        assert_eq!(message.message.content.as_deref(), Some("Hello"));
+        assert!(message.message.tool_calls.is_none());
+        assert_eq!(message.usage.expect("usage").total_tokens, 11);
     }
 }

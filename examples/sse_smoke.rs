@@ -30,7 +30,7 @@ async fn run() -> Result<()> {
         "只输出说明正文，不要使用工具，不要标题。"
     );
 
-    let message = model
+    let response = model
         .complete_stream(&[Message::user(prompt)], &[], handler)
         .await?;
     println!();
@@ -39,7 +39,7 @@ async fn run() -> Result<()> {
         .lock()
         .map_err(|_| Error::Agent("SSE delta buffer lock was poisoned".to_owned()))?;
     let streamed = values.concat();
-    let final_content = message.content.as_deref().unwrap_or_default();
+    let final_content = response.message.content.as_deref().unwrap_or_default();
     let aggregate_matches = streamed == final_content;
     let truly_incremental = values.len() >= 2;
 
@@ -49,11 +49,22 @@ async fn run() -> Result<()> {
     println!("SSE aggregate matches final message: {aggregate_matches}");
     println!(
         "SSE reasoning_content received: {}",
-        message
+        response
+            .message
             .reasoning_content
             .as_deref()
             .is_some_and(|value| !value.is_empty())
     );
+    if let Some(usage) = response.usage {
+        println!(
+            "SSE API usage: prompt {} + completion {} = {} tokens",
+            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+        );
+    } else {
+        return Err(Error::Agent(
+            "streaming response did not include API token usage".to_owned(),
+        ));
+    }
 
     if !aggregate_matches {
         return Err(Error::Agent(

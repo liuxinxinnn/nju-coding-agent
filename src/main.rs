@@ -5,7 +5,9 @@ use std::sync::Arc;
 use clap::Parser;
 use nju_coding_agent::tools::default_registry;
 use nju_coding_agent::tui;
-use nju_coding_agent::{Agent, Config, HttpLanguageModel, Result};
+use nju_coding_agent::{
+    Agent, Config, HttpLanguageModel, MarkdownMemoryStore, MemoryProvider, Result,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "nju-coding-agent")]
@@ -77,11 +79,14 @@ fn build_agent(config: &Config) -> Result<Agent> {
         config.max_steps,
         config.context_window_tokens,
     );
+    let memory = MarkdownMemoryStore::open_default(&config.workspace)?;
+    agent.set_memory_snapshot(&memory.snapshot()?);
     agent.set_planning_enabled(config.planning_enabled);
     Ok(agent)
 }
 
 async fn run_plain_repl(config: &Config, agent: &mut Agent) -> Result<()> {
+    let memory = MarkdownMemoryStore::open_default(&config.workspace)?;
     println!("Workspace: {}", config.workspace.display());
     println!("Enter a task, or /quit to exit.");
     loop {
@@ -98,6 +103,7 @@ async fn run_plain_repl(config: &Config, agent: &mut Agent) -> Result<()> {
         if input.is_empty() {
             continue;
         }
+        agent.set_memory_snapshot(&memory.snapshot()?);
         match agent.run_turn(input).await {
             Ok(answer) => println!("{answer}"),
             Err(error) => eprintln!("turn failed: {error}"),

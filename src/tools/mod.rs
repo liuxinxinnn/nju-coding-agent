@@ -3,14 +3,25 @@ mod files;
 mod sandbox;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::error::Result;
+use crate::memory::{MarkdownMemoryStore, MemoryTool};
 use crate::tool::ToolRegistry;
 
 pub use command::{ApprovalFn, CommandDecision, CommandPolicy};
 pub use sandbox::Sandbox;
 
 pub fn default_registry(workspace: PathBuf, auto_approve: bool) -> Result<ToolRegistry> {
+    let memory = Arc::new(MarkdownMemoryStore::open_default(&workspace)?);
+    registry_with_memory(workspace, auto_approve, memory)
+}
+
+fn registry_with_memory(
+    workspace: PathBuf,
+    auto_approve: bool,
+    memory: Arc<MarkdownMemoryStore>,
+) -> Result<ToolRegistry> {
     let sandbox = Sandbox::new(workspace)?;
     let mut registry = ToolRegistry::new();
     registry.register(files::ReadFile::new(sandbox.clone()))?;
@@ -18,6 +29,7 @@ pub fn default_registry(workspace: PathBuf, auto_approve: bool) -> Result<ToolRe
     registry.register(files::SearchText::new(sandbox.clone()))?;
     registry.register(files::WriteFile::new(sandbox.clone()))?;
     registry.register(files::ReplaceText::new(sandbox.clone()))?;
+    registry.register(MemoryTool::new(memory))?;
     registry.register(command::RunCommand::new(sandbox, auto_approve))?;
     Ok(registry)
 }
@@ -27,6 +39,7 @@ pub fn default_registry_with_approval(
     auto_approve: bool,
     approval: ApprovalFn,
 ) -> Result<ToolRegistry> {
+    let memory = Arc::new(MarkdownMemoryStore::open_default(&workspace)?);
     let sandbox = Sandbox::new(workspace)?;
     let mut registry = ToolRegistry::new();
     registry.register(files::ReadFile::new(sandbox.clone()))?;
@@ -34,6 +47,7 @@ pub fn default_registry_with_approval(
     registry.register(files::SearchText::new(sandbox.clone()))?;
     registry.register(files::WriteFile::new(sandbox.clone()))?;
     registry.register(files::ReplaceText::new(sandbox.clone()))?;
+    registry.register(MemoryTool::new(memory))?;
     registry.register(command::RunCommand::with_approval(
         sandbox,
         auto_approve,
@@ -48,14 +62,20 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::default_registry;
+    use crate::memory::MarkdownMemoryStore;
+
+    use super::registry_with_memory;
 
     #[tokio::test]
     async fn default_tools_complete_a_file_edit_workflow() {
         let workspace = tempdir().expect("workspace");
+        let data = tempdir().expect("data");
         fs::write(workspace.path().join(".env"), "SECRET=hidden").expect("secret fixture");
-        let registry =
-            default_registry(workspace.path().to_path_buf(), true).expect("tool registry");
+        let memory = std::sync::Arc::new(
+            MarkdownMemoryStore::new(data.path().to_path_buf(), workspace.path()).expect("memory"),
+        );
+        let registry = registry_with_memory(workspace.path().to_path_buf(), true, memory)
+            .expect("tool registry");
 
         let written = registry
             .execute(

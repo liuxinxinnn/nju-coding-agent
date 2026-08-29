@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use crate::agent::{AgentEvent, AgentPhase};
 use crate::context::{ContextUsage, DEFAULT_CONTEXT_WINDOW_TOKENS};
 use crate::llm::{Message, Role};
+use crate::memory::{MarkdownMemoryStore, MemoryProvider};
 use crate::session::{SessionStore, SessionSummary, StoredSession};
 use crate::tools::{ApprovalFn, default_registry_with_approval};
 use crate::{Agent, Config, HttpLanguageModel, Result};
@@ -43,6 +44,7 @@ enum WorkerCommand {
     ListSessions,
     SwitchSession(String),
     DeleteSession(String),
+    ShowMemory,
     Shutdown,
 }
 
@@ -265,10 +267,26 @@ impl App {
                     covered_messages,
                     before_tokens,
                     after_tokens,
+                    stages,
                 } => self.push_event(
                     EventKind::Context,
                     format!(
-                        "压缩 {covered_messages} 条消息 · {before_tokens} → {after_tokens} tokens"
+                        "压缩 {covered_messages} 条消息 · {before_tokens} → {after_tokens} tokens · {}",
+                        stages.join(" → ")
+                    ),
+                ),
+                AgentEvent::UsageRecorded {
+                    usage,
+                    calibration_millis,
+                } => self.push_event(
+                    EventKind::Context,
+                    format!(
+                        "API {}+{}={} tokens · 校准 {}.{:03}x",
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        usage.total_tokens,
+                        calibration_millis / 1_000,
+                        calibration_millis % 1_000
                     ),
                 ),
                 AgentEvent::WorkspaceChanged {
@@ -573,6 +591,9 @@ impl App {
                 };
                 self.push_message(MessageRole::System, format!("可用工具：\n- {tools}"));
             }
+            "/memory" if parts.next().is_none() => {
+                self.send_session_command(command_tx, WorkerCommand::ShowMemory)
+            }
             "/plan" => match (parts.next(), parts.next()) {
                 (None, None) => self.push_message(
                     MessageRole::System,
@@ -738,6 +759,20 @@ async fn worker_loop(
         config.max_steps,
         config.context_window_tokens,
     );
+    let memory = match MarkdownMemoryStore::open_default(&config.workspace) {
+        Ok(memory) => memory,
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::Fatal(format!("无法初始化长期记忆：{error}")));
+            return;
+        }
+    };
+    match memory.snapshot() {
+        Ok(snapshot) => agent.set_memory_snapshot(&snapshot),
+        Err(error) => {
+            let _ = event_tx.send(WorkerEvent::Fatal(format!("无法读取长期记忆：{error}")));
+            return;
+        }
+    }
     agent.set_planning_enabled(config.planning_enabled);
     let agent_events = event_tx.clone();
     agent.on_event(move |event| {
@@ -796,10 +831,16 @@ async fn worker_loop(
         match command {
             WorkerCommand::Chat(task) => {
                 let _ = event_tx.send(WorkerEvent::Started);
+                if let Ok(snapshot) = memory.snapshot() {
+                    agent.set_memory_snapshot(&snapshot);
+                }
                 let result = agent
                     .run_turn(&task)
                     .await
                     .map_err(|error| error.to_string());
+                if let Ok(snapshot) = memory.snapshot() {
+                    agent.set_memory_snapshot(&snapshot);
+                }
                 current_session.update(agent.export_state(), Some(&task));
                 if let Err(error) = store.save(&current_session) {
                     let _ = event_tx.send(WorkerEvent::Notice(format!("会话保存失败：{error}")));
@@ -928,6 +969,27 @@ async fn worker_loop(
                 },
                 Err(error) => {
                     let _ = event_tx.send(WorkerEvent::Notice(format!("删除会话失败：{error}")));
+                }
+            },
+            WorkerCommand::ShowMemory => match memory.snapshot() {
+                Ok(snapshot) => {
+                    agent.set_memory_snapshot(&snapshot);
+                    current_session.update(agent.export_state(), None);
+                    if let Err(error) = store.save(&current_session) {
+                        let _ = event_tx.send(WorkerEvent::Notice(format!(
+                            "记忆已重载，但会话保存失败：{error}"
+                        )));
+                    } else {
+                        let _ = event_tx.send(WorkerEvent::Notice(
+                            memory
+                                .display()
+                                .unwrap_or_else(|error| format!("读取记忆失败：{error}")),
+                        ));
+                    }
+                    send_context_updated(&event_tx, &agent);
+                }
+                Err(error) => {
+                    let _ = event_tx.send(WorkerEvent::Notice(format!("读取记忆失败：{error}")));
                 }
             },
             WorkerCommand::Shutdown => {
@@ -1334,6 +1396,9 @@ mod tests {
         assert!(app.show_context);
         app.handle_command("/context", &sender);
         assert!(!app.show_context);
+
+        app.handle_command("/memory", &sender);
+        assert!(matches!(receiver.try_recv(), Ok(WorkerCommand::ShowMemory)));
     }
 
     #[test]

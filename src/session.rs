@@ -209,36 +209,33 @@ impl SessionStore {
 }
 
 fn default_session_root() -> Result<PathBuf> {
+    Ok(default_data_root()?.join("sessions"))
+}
+
+pub fn default_data_root() -> Result<PathBuf> {
     if let Some(root) = non_empty_env("CODING_AGENT_DATA_DIR") {
-        return Ok(PathBuf::from(root).join("sessions"));
+        return Ok(PathBuf::from(root));
     }
 
     #[cfg(windows)]
     if let Some(root) = non_empty_env("LOCALAPPDATA") {
-        return Ok(PathBuf::from(root)
-            .join("nju-coding-agent")
-            .join("sessions"));
+        return Ok(PathBuf::from(root).join("nju-coding-agent"));
     }
 
     #[cfg(not(windows))]
     {
         if let Some(root) = non_empty_env("XDG_DATA_HOME") {
-            return Ok(PathBuf::from(root)
-                .join("nju-coding-agent")
-                .join("sessions"));
+            return Ok(PathBuf::from(root).join("nju-coding-agent"));
         }
         if let Some(home) = non_empty_env("HOME") {
             return Ok(PathBuf::from(home)
                 .join(".local")
                 .join("share")
-                .join("nju-coding-agent")
-                .join("sessions"));
+                .join("nju-coding-agent"));
         }
     }
 
-    Ok(env::current_dir()?
-        .join(".nju-coding-agent-data")
-        .join("sessions"))
+    Ok(env::current_dir()?.join(".nju-coding-agent-data"))
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -321,6 +318,7 @@ mod tests {
             workspace_revision: 2,
             last_verified_revision: Some(2),
             planning_enabled: false,
+            context: Default::default(),
         }
     }
 
@@ -395,5 +393,6 @@ mod tests {
         .expect("deserialize old state");
 
         assert!(state.planning_enabled);
+        assert_eq!(state.context, Default::default());
     }
 }

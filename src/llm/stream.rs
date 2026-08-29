@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use super::{FunctionCall, Message, Role, ToolCall};
+use super::{FunctionCall, Message, ModelResponse, Role, TokenUsage, ToolCall};
 use crate::error::{Error, Result};
 
 #[derive(Default)]
@@ -61,6 +61,7 @@ struct StreamEnvelope {
     #[serde(default)]
     choices: Vec<StreamChoice>,
     error: Option<StreamApiError>,
+    usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +152,7 @@ pub(super) struct StreamAccumulator {
     reasoning_content: String,
     tool_calls: BTreeMap<usize, ToolCallAccumulator>,
     received_choice: bool,
+    usage: Option<TokenUsage>,
 }
 
 impl StreamAccumulator {
@@ -163,6 +165,9 @@ impl StreamAccumulator {
                     .message
                     .unwrap_or_else(|| "streaming API returned an error".to_owned()),
             ));
+        }
+        if envelope.usage.is_some() {
+            self.usage = envelope.usage;
         }
         let Some(choice) = envelope.choices.into_iter().next() else {
             return Ok(None);
@@ -187,7 +192,7 @@ impl StreamAccumulator {
         Ok(None)
     }
 
-    pub(super) fn finish(self) -> Result<Message> {
+    pub(super) fn finish(self) -> Result<ModelResponse> {
         if !self.received_choice {
             return Err(Error::Llm(
                 "streaming response contained no choices".to_owned(),
@@ -206,12 +211,15 @@ impl StreamAccumulator {
                     .collect::<Result<Vec<_>>>()?,
             )
         };
-        Ok(Message {
-            role: Role::Assistant,
-            content,
-            reasoning_content,
-            tool_calls,
-            tool_call_id: None,
+        Ok(ModelResponse {
+            message: Message {
+                role: Role::Assistant,
+                content,
+                reasoning_content,
+                tool_calls,
+                tool_call_id: None,
+            },
+            usage: self.usage,
         })
     }
 }
@@ -249,17 +257,23 @@ mod tests {
                 r#"{"choices":[{"delta":{"content":"lo","tool_calls":[{"index":0,"function":{"name":"file","arguments":"th\":\"a.py\"}"}}]}}]}"#,
             )
             .expect("second delta");
+        accumulator
+            .ingest_json(
+                r#"{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":3,"total_tokens":23}}"#,
+            )
+            .expect("usage delta");
 
         let message = accumulator.finish().expect("complete message");
 
         assert_eq!(first.as_deref(), Some("Hel"));
         assert_eq!(second.as_deref(), Some("lo"));
-        assert_eq!(message.content.as_deref(), Some("Hello"));
-        assert_eq!(message.reasoning_content.as_deref(), Some("think"));
-        let call = &message.tool_calls.expect("tool calls")[0];
+        assert_eq!(message.message.content.as_deref(), Some("Hello"));
+        assert_eq!(message.message.reasoning_content.as_deref(), Some("think"));
+        let call = &message.message.tool_calls.expect("tool calls")[0];
         assert_eq!(call.id, "call-1");
         assert_eq!(call.function.name, "read_file");
         assert_eq!(call.function.arguments, r#"{"path":"a.py"}"#);
+        assert_eq!(message.usage.expect("usage").total_tokens, 23);
     }
 
     #[test]
@@ -274,6 +288,7 @@ mod tests {
         let calls = accumulator
             .finish()
             .expect("message")
+            .message
             .tool_calls
             .expect("calls");
         assert_eq!(calls.len(), 2);

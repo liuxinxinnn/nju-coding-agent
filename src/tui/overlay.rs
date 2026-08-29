@@ -48,7 +48,7 @@ pub(super) fn draw_help(frame: &mut Frame<'_>) {
         Line::from("  F1              关闭帮助"),
         Line::from("  Ctrl+D / /exit  退出"),
         Line::from(String::new()),
-        Line::from("命令：/help /context /plan on|off /clear /status /tools /exit"),
+        Line::from("命令：/help /context /memory /plan on|off /clear /status /tools /exit"),
         Line::from("会话：/new /sessions /switch <id> /delete <id>"),
     ];
     let panel = Paragraph::new(text)
@@ -64,12 +64,12 @@ pub(super) fn draw_help(frame: &mut Frame<'_>) {
 }
 
 pub(super) fn draw_context(frame: &mut Frame<'_>, usage: ContextUsage, message_count: usize) {
-    let area = centered_rect(82, 72, frame.area());
+    let area = centered_rect(82, 92, frame.area());
     let used_tenths = percent_tenths(usage.used_tokens, usage.window_tokens);
     let mut text = vec![
         Line::from(Span::styled(
             format!(
-                "Estimated current prompt: {} / {} tokens ({}.{:01}%)",
+                "Calibrated current prompt: {} / {} tokens ({}.{:01}%)",
                 usage.used_tokens,
                 usage.window_tokens,
                 used_tenths / 10,
@@ -78,8 +78,10 @@ pub(super) fn draw_context(frame: &mut Frame<'_>, usage: ContextUsage, message_c
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(format!(
-            "Conservative local estimate · {} stored messages",
-            message_count
+            "Local estimate × {}.{:03} · {} stored messages",
+            usage.calibration_millis / 1_000,
+            usage.calibration_millis % 1_000,
+            message_count,
         )),
         Line::from(String::new()),
         render_context_bar(usage),
@@ -93,8 +95,22 @@ pub(super) fn draw_context(frame: &mut Frame<'_>, usage: ContextUsage, message_c
         kv_line("Messages", usage.message_tokens, usage.window_tokens),
         kv_line("Free space", usage.free_tokens, usage.window_tokens),
         Line::from(String::new()),
+        Line::from(format!(
+            "Last API call     prompt {} + completion {} = {} tokens",
+            usage.api_usage.last_prompt_tokens,
+            usage.api_usage.last_completion_tokens,
+            usage.api_usage.last_total_tokens
+        )),
+        Line::from(format!(
+            "Session API total {} requests · prompt {} + completion {} = {} tokens",
+            usage.api_usage.requests,
+            usage.api_usage.prompt_tokens,
+            usage.api_usage.completion_tokens,
+            usage.api_usage.total_tokens
+        )),
+        Line::from(String::new()),
         Line::from(Span::styled(
-            "The estimate includes system instructions, tool definitions/results, and conversation history.",
+            "Current prompt is estimated; real API usage calibrates later estimates and is tracked separately.",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(

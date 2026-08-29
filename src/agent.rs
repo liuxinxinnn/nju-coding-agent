@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::context::{ContextManager, ContextUsage};
+use crate::context::{CompressionPreparation, ContextManager, ContextState, ContextUsage};
 use crate::error::{Error, Result};
-use crate::llm::{DeltaHandler, LanguageModel, Message, Role};
+use crate::llm::{DeltaHandler, LanguageModel, Message, Role, TokenUsage, ToolDefinition};
+use crate::memory::MemorySnapshot;
 use crate::project::ProjectProfile;
 use crate::tool::ToolRegistry;
 
@@ -43,6 +44,8 @@ pub struct AgentState {
     pub last_verified_revision: Option<u64>,
     #[serde(default = "planning_enabled_default")]
     pub planning_enabled: bool,
+    #[serde(default)]
+    pub context: ContextState,
 }
 
 const fn planning_enabled_default() -> bool {
@@ -85,6 +88,11 @@ pub enum AgentEvent {
         covered_messages: usize,
         before_tokens: u64,
         after_tokens: u64,
+        stages: Vec<String>,
+    },
+    UsageRecorded {
+        usage: TokenUsage,
+        calibration_millis: u64,
     },
     WorkspaceChanged {
         revision: u64,
@@ -115,6 +123,7 @@ pub struct Agent {
     last_verified_revision: Option<u64>,
     planning_enabled: bool,
     project: ProjectProfile,
+    base_system_prompt: String,
     initial_system_message: Message,
 }
 
@@ -127,7 +136,8 @@ impl Agent {
         context_window_tokens: u64,
     ) -> Self {
         let project = ProjectProfile::detect(workspace);
-        let initial_system_message = Message::system(system_prompt(workspace, &project));
+        let base_system_prompt = system_prompt(workspace, &project);
+        let initial_system_message = Message::system(base_system_prompt.clone());
         Self {
             model,
             tools,
@@ -140,6 +150,7 @@ impl Agent {
             last_verified_revision: None,
             planning_enabled: true,
             project,
+            base_system_prompt,
             initial_system_message,
         }
     }
@@ -175,6 +186,17 @@ impl Agent {
         self.planning_enabled = enabled;
     }
 
+    pub fn set_memory_snapshot(&mut self, snapshot: &MemorySnapshot) {
+        self.initial_system_message = Message::system(format!(
+            "{}{}",
+            self.base_system_prompt,
+            snapshot.prompt_section()
+        ));
+        if let Some(system) = self.messages.first_mut() {
+            *system = self.initial_system_message.clone();
+        }
+    }
+
     pub fn context_usage(&self) -> ContextUsage {
         self.context
             .usage(&self.messages, &self.tools.definitions())
@@ -190,6 +212,7 @@ impl Agent {
             workspace_revision: self.workspace_revision,
             last_verified_revision: self.last_verified_revision,
             planning_enabled: self.planning_enabled,
+            context: self.context.state(),
         }
     }
 
@@ -212,6 +235,7 @@ impl Agent {
         self.workspace_revision = state.workspace_revision;
         self.last_verified_revision = state.last_verified_revision;
         self.planning_enabled = state.planning_enabled;
+        self.context.restore_state(state.context);
         self.phase = AgentPhase::Done;
         Ok(())
     }
@@ -220,6 +244,7 @@ impl Agent {
         self.messages = vec![self.initial_system_message.clone()];
         self.workspace_revision = 0;
         self.last_verified_revision = None;
+        self.context.restore_state(ContextState::default());
         self.phase = AgentPhase::Done;
     }
 
@@ -270,16 +295,7 @@ impl Agent {
             } else {
                 &definitions
             };
-            if let Some(event) = self
-                .context
-                .compact_if_needed(&mut self.messages, active_definitions)?
-            {
-                self.emit(AgentEvent::ContextCompressed {
-                    covered_messages: event.covered_messages,
-                    before_tokens: event.before_tokens,
-                    after_tokens: event.after_tokens,
-                });
-            }
+            self.compact_context_if_needed(active_definitions).await?;
             let delta_events = self.event_handler.clone();
             let response_phase = self.phase;
             let delta_handler: DeltaHandler = Arc::new(move |delta| {
@@ -291,10 +307,14 @@ impl Agent {
                     });
                 }
             });
-            let response = self
+            let model_response = self
                 .model
                 .complete_stream(&self.messages, active_definitions, delta_handler)
                 .await?;
+            if let Some(usage) = model_response.usage {
+                self.record_api_usage(active_definitions, usage);
+            }
+            let response = model_response.message;
             let tool_calls = response.tool_calls.clone().unwrap_or_default();
             let final_text = response.content.clone().unwrap_or_default();
             self.messages.push(response);
@@ -460,6 +480,57 @@ impl Agent {
         self.workspace_revision == 0 || self.last_verified_revision == Some(self.workspace_revision)
     }
 
+    async fn compact_context_if_needed(
+        &mut self,
+        active_definitions: &[ToolDefinition],
+    ) -> Result<()> {
+        let preparation = self
+            .context
+            .prepare_compaction(&mut self.messages, active_definitions)?;
+        let event = match preparation {
+            CompressionPreparation::None => return Ok(()),
+            CompressionPreparation::Complete(event) => event,
+            CompressionPreparation::NeedsSummary(request) => {
+                let summary_messages = self.context.summary_messages(&request);
+                let smart_summary = match self.model.complete(&summary_messages, &[]).await {
+                    Ok(response) => {
+                        if let Some(usage) = response.usage {
+                            self.context.record_api_usage(&summary_messages, &[], usage);
+                            self.emit(AgentEvent::UsageRecorded {
+                                usage,
+                                calibration_millis: self.context.state().calibration_millis,
+                            });
+                        }
+                        response.message.content
+                    }
+                    Err(_) => None,
+                };
+                self.context.finish_summary(
+                    &mut self.messages,
+                    active_definitions,
+                    request,
+                    smart_summary,
+                )?
+            }
+        };
+        self.emit(AgentEvent::ContextCompressed {
+            covered_messages: event.covered_messages,
+            before_tokens: event.before_tokens,
+            after_tokens: event.after_tokens,
+            stages: event.stages,
+        });
+        Ok(())
+    }
+
+    fn record_api_usage(&mut self, active_definitions: &[ToolDefinition], usage: TokenUsage) {
+        self.context
+            .record_api_usage(&self.messages, active_definitions, usage);
+        self.emit(AgentEvent::UsageRecorded {
+            usage,
+            calibration_millis: self.context.state().calibration_millis,
+        });
+    }
+
     fn transition_to(&mut self, phase: AgentPhase) {
         if self.phase != phase {
             self.phase = phase;
@@ -505,8 +576,21 @@ impl Agent {
                 covered_messages,
                 before_tokens,
                 after_tokens,
+                stages,
             } => println!(
-                "[context] compressed {covered_messages} messages: {before_tokens} -> {after_tokens} estimated tokens"
+                "[context] compressed {covered_messages} messages: {before_tokens} -> {after_tokens} estimated tokens · {}",
+                stages.join(" -> ")
+            ),
+            AgentEvent::UsageRecorded {
+                usage,
+                calibration_millis,
+            } => println!(
+                "[usage] prompt {} + completion {} = {} tokens · estimate calibration {}.{:03}x",
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                calibration_millis / 1_000,
+                calibration_millis % 1_000
             ),
             AgentEvent::WorkspaceChanged {
                 revision,
@@ -688,7 +772,7 @@ fn system_prompt(workspace: &Path, project: &ProjectProfile) -> String {
          Follow the runtime-selected flow: PLAN -> EXECUTE -> VERIFY when Plan mode is enabled, or EXECUTE -> VERIFY when it is disabled. Inspect relevant files before editing. Always use write_file to create files and replace_text for small edits; never use run_command, shell redirection, or PowerShell file commands to create or edit files. Use run_command only to build, test, lint, or run the resulting project. A command result may be reused while the workspace is unchanged, but the same verification command must run again after a successful file edit. Tool errors \
          are observations: correct the request instead of pretending it succeeded. Never request \
          secrets or bypass the sandbox and command policy. When the task is complete, respond with \
-         a concise summary of changes and verification performed. {}",
+         a concise summary of changes and verification performed. Use the memory tool only for durable, non-secret facts that will matter in future sessions; never store routine progress, command output, or credentials. {}",
         human_path(workspace),
         project.prompt_hint()
     )
@@ -720,7 +804,9 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::error::{Error, Result};
-    use crate::llm::{FunctionCall, LanguageModel, Message, Role, ToolCall, ToolDefinition};
+    use crate::llm::{
+        FunctionCall, LanguageModel, Message, ModelResponse, Role, ToolCall, ToolDefinition,
+    };
     use crate::project::ProjectProfile;
     use crate::tool::{Tool, ToolRegistry};
 
@@ -736,11 +822,12 @@ mod tests {
             &self,
             _messages: &[Message],
             _tools: &[ToolDefinition],
-        ) -> Result<Message> {
+        ) -> Result<ModelResponse> {
             self.responses
                 .lock()
                 .map_err(|_| Error::Llm("mock lock poisoned".to_owned()))?
                 .pop_front()
+                .map(ModelResponse::from)
                 .ok_or_else(|| Error::Llm("mock response exhausted".to_owned()))
         }
     }
@@ -1326,6 +1413,7 @@ mod tests {
             workspace_revision: 3,
             last_verified_revision: Some(3),
             planning_enabled: false,
+            context: Default::default(),
         };
 
         agent.restore_state(state).expect("restore state");
@@ -1363,6 +1451,7 @@ mod tests {
                 workspace_revision: 1,
                 last_verified_revision: Some(2),
                 planning_enabled: true,
+                context: Default::default(),
             })
             .expect_err("invalid revision must be rejected");
 
