@@ -7,9 +7,9 @@
 - 预期结果：共 5 个测试，3 个通过，2 个失败
 - 成功约束：`src/lib.rs` 必须修改，测试文件必须保持不变
 
-## PEV real-model run
+## Latest PEV real-model rerun
 
-日期：2026-08-28。模型：`deepseek-v4-flash`。
+日期：2026-08-30。模型：`deepseek-v4-flash`。Agent 提交：`28c3460`。
 
 | 指标 | 结果 |
 |---|---|
@@ -18,7 +18,7 @@
 | 阶段序列 | `PLAN → EXEC → VERIFY → DONE` |
 | Agent 步数 / 工具调用 | 6 / 8 |
 | Workspace revision | 1，当前 revision 验证通过 |
-| 耗时 | 17.51 秒 |
+| 耗时 | 21.41 秒 |
 | 测试文件 | SHA-256 一致，未修改 |
 | 要求修改的生产文件 | `src/lib.rs` 已修改 |
 

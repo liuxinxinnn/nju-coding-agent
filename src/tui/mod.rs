@@ -9,9 +9,11 @@ use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Duration;
 
 use crossterm::event::{
-    self, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    self, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::Frame;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -90,6 +92,49 @@ struct PendingConfirmation {
     response: std_mpsc::Sender<bool>,
 }
 
+struct SessionPicker {
+    current_id: String,
+    sessions: Vec<SessionSummary>,
+    selected: usize,
+}
+
+impl SessionPicker {
+    fn new(current_id: String, sessions: Vec<SessionSummary>) -> Self {
+        let selected = sessions
+            .iter()
+            .position(|session| session.id == current_id)
+            .unwrap_or(0);
+        Self {
+            current_id,
+            sessions,
+            selected,
+        }
+    }
+
+    fn select_previous(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.selected = if self.selected == 0 {
+            self.sessions.len() - 1
+        } else {
+            self.selected - 1
+        };
+    }
+
+    fn select_next(&mut self) {
+        if !self.sessions.is_empty() {
+            self.selected = (self.selected + 1) % self.sessions.len();
+        }
+    }
+
+    fn selected_id(&self) -> Option<&str> {
+        self.sessions
+            .get(self.selected)
+            .map(|session| session.id.as_str())
+    }
+}
+
 struct App {
     workspace: PathBuf,
     model: String,
@@ -117,8 +162,15 @@ struct App {
     chat_scroll: u16,
     follow_chat: bool,
     chat_height: u16,
+    chat_area: Rect,
+    events_scroll: u16,
+    follow_events: bool,
+    events_height: u16,
+    events_max_scroll: u16,
+    events_area: Rect,
     input_width: usize,
     pending_confirmation: Option<PendingConfirmation>,
+    session_picker: Option<SessionPicker>,
     streaming_index: Option<usize>,
     streaming_phase: Option<AgentPhase>,
 }
@@ -155,8 +207,15 @@ impl App {
             chat_scroll: 0,
             follow_chat: true,
             chat_height: 10,
+            chat_area: Rect::default(),
+            events_scroll: 0,
+            follow_events: true,
+            events_height: 10,
+            events_max_scroll: 0,
+            events_area: Rect::default(),
             input_width: 1,
             pending_confirmation: None,
+            session_picker: None,
             streaming_index: None,
             streaming_phase: None,
         }
@@ -174,7 +233,33 @@ impl App {
         self.events.push(EventEntry::new(kind, text));
         if self.events.len() > MAX_EVENTS {
             self.events.remove(0);
+            if !self.follow_events {
+                self.events_scroll = self.events_scroll.saturating_sub(1);
+            }
         }
+    }
+
+    fn scroll_events_up(&mut self, rows: u16) {
+        self.follow_events = false;
+        self.events_scroll = self.events_scroll.saturating_sub(rows.max(1));
+    }
+
+    fn scroll_events_down(&mut self, rows: u16) {
+        self.events_scroll = self
+            .events_scroll
+            .saturating_add(rows.max(1))
+            .min(self.events_max_scroll);
+        self.follow_events = self.events_scroll >= self.events_max_scroll;
+    }
+
+    fn scroll_events_top(&mut self) {
+        self.follow_events = false;
+        self.events_scroll = 0;
+    }
+
+    fn follow_latest_events(&mut self) {
+        self.follow_events = true;
+        self.events_scroll = self.events_max_scroll;
     }
 
     fn apply_worker_event(&mut self, event: WorkerEvent) {
@@ -358,6 +443,7 @@ impl App {
                 message_count,
             } => {
                 self.discard_streaming();
+                self.session_picker = None;
                 self.session_id = id.clone();
                 self.workspace_revision = workspace_revision;
                 self.last_verified_revision = last_verified_revision;
@@ -405,11 +491,11 @@ impl App {
                 current_id,
                 sessions,
             } => {
-                self.push_message(
-                    MessageRole::System,
-                    format_session_list(&current_id, &sessions),
-                );
-                self.push_event(EventKind::Session, format!("共 {} 个会话", sessions.len()));
+                let session_count = sessions.len();
+                self.show_help = false;
+                self.show_context = false;
+                self.session_picker = Some(SessionPicker::new(current_id, sessions));
+                self.push_event(EventKind::Session, format!("共 {session_count} 个会话"));
             }
             WorkerEvent::Notice(message) => {
                 self.push_message(MessageRole::System, message.clone());
@@ -690,6 +776,7 @@ pub async fn run(config: Config) -> Result<()> {
                 {
                     handle_key(&mut app, key, &command_tx);
                 }
+                TerminalEvent::Mouse(mouse) => handle_mouse(&mut app, mouse),
                 TerminalEvent::Resize(_, _) => {}
                 _ => {}
             }
@@ -1036,6 +1123,10 @@ fn handle_key(app: &mut App, key: KeyEvent, command_tx: &mpsc::UnboundedSender<W
         }
         return;
     }
+    if app.session_picker.is_some() {
+        handle_session_picker_key(app, key, command_tx);
+        return;
+    }
     if app.show_help {
         if matches!(key.code, KeyCode::F(1) | KeyCode::Esc) {
             app.show_help = false;
@@ -1052,6 +1143,12 @@ fn handle_key(app: &mut App, key: KeyEvent, command_tx: &mpsc::UnboundedSender<W
         match key.code {
             KeyCode::Char('c' | 'd') => app.should_quit = true,
             KeyCode::Char('l') => app.events_collapsed = !app.events_collapsed,
+            KeyCode::Up => app.scroll_events_up(1),
+            KeyCode::Down => app.scroll_events_down(1),
+            KeyCode::PageUp => app.scroll_events_up(app.events_height.max(1)),
+            KeyCode::PageDown => app.scroll_events_down(app.events_height.max(1)),
+            KeyCode::Home => app.scroll_events_top(),
+            KeyCode::End => app.follow_latest_events(),
             KeyCode::Char('p') => {
                 if let Some(value) = app.history.prev() {
                     app.input.set_text(&value);
@@ -1105,10 +1202,91 @@ fn handle_key(app: &mut App, key: KeyEvent, command_tx: &mpsc::UnboundedSender<W
     }
 }
 
+fn handle_session_picker_key(
+    app: &mut App,
+    key: KeyEvent,
+    command_tx: &mpsc::UnboundedSender<WorkerCommand>,
+) {
+    match key.code {
+        KeyCode::Esc => app.session_picker = None,
+        KeyCode::Up => {
+            if let Some(picker) = &mut app.session_picker {
+                picker.select_previous();
+            }
+        }
+        KeyCode::Down => {
+            if let Some(picker) = &mut app.session_picker {
+                picker.select_next();
+            }
+        }
+        KeyCode::Home => {
+            if let Some(picker) = &mut app.session_picker {
+                picker.selected = 0;
+            }
+        }
+        KeyCode::End => {
+            if let Some(picker) = &mut app.session_picker
+                && !picker.sessions.is_empty()
+            {
+                picker.selected = picker.sessions.len() - 1;
+            }
+        }
+        KeyCode::Char('n' | 'N') => {
+            app.session_picker = None;
+            app.send_session_command(command_tx, WorkerCommand::NewSession);
+        }
+        KeyCode::Enter => {
+            let selected = app.session_picker.as_ref().and_then(|picker| {
+                picker
+                    .selected_id()
+                    .map(|id| (id.to_owned(), picker.current_id.clone()))
+            });
+            app.session_picker = None;
+            if let Some((selected_id, current_id)) = selected {
+                if selected_id == current_id {
+                    app.push_event(EventKind::Session, "当前已在所选会话");
+                } else {
+                    app.send_session_command(command_tx, WorkerCommand::SwitchSession(selected_id));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    const MOUSE_SCROLL_ROWS: u16 = 3;
+    match mouse.kind {
+        MouseEventKind::ScrollUp if contains(app.events_area, mouse.column, mouse.row) => {
+            app.scroll_events_up(MOUSE_SCROLL_ROWS);
+        }
+        MouseEventKind::ScrollDown if contains(app.events_area, mouse.column, mouse.row) => {
+            app.scroll_events_down(MOUSE_SCROLL_ROWS);
+        }
+        MouseEventKind::ScrollUp if contains(app.chat_area, mouse.column, mouse.row) => {
+            app.follow_chat = false;
+            app.chat_scroll = app.chat_scroll.saturating_sub(MOUSE_SCROLL_ROWS);
+        }
+        MouseEventKind::ScrollDown if contains(app.chat_area, mouse.column, mouse.row) => {
+            app.chat_scroll = app.chat_scroll.saturating_add(MOUSE_SCROLL_ROWS);
+        }
+        _ => {}
+    }
+}
+
+fn contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let Some(areas) = split(frame.area(), app.events_collapsed) else {
         return;
     };
+    app.chat_area = areas.chat;
+    app.events_area = areas.events;
     let workspace = Paragraph::new(vec![
         Line::from(Span::styled(
             "NJU Coding Agent",
@@ -1181,22 +1359,33 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(chat, areas.chat);
 
     if !app.events_collapsed {
+        app.events_height = areas.events.height.saturating_sub(2).max(1);
         let event_lines = app
             .events
             .iter()
             .map(EventEntry::render_line)
             .collect::<Vec<_>>();
+        let events_title = if app.follow_events {
+            "Events · wheel/Ctrl+↑↓"
+        } else {
+            "Events · paused · Ctrl+End"
+        };
         let events = Paragraph::new(event_lines)
-            .block(Block::default().borders(Borders::ALL).title("Events"))
+            .block(Block::default().borders(Borders::ALL).title(events_title))
             .wrap(Wrap { trim: false });
         let event_width = areas.events.width.saturating_sub(2).max(1);
-        let event_scroll = u16::try_from(
+        app.events_max_scroll = u16::try_from(
             events
                 .line_count(event_width)
-                .saturating_sub(areas.events.height as usize),
+                .saturating_sub(usize::from(app.events_height)),
         )
         .unwrap_or(u16::MAX);
-        let events = events.scroll((event_scroll, 0));
+        if app.follow_events {
+            app.events_scroll = app.events_max_scroll;
+        } else {
+            app.events_scroll = app.events_scroll.min(app.events_max_scroll);
+        }
+        let events = events.scroll((app.events_scroll, 0));
         frame.render_widget(events, areas.events);
     }
 
@@ -1242,11 +1431,15 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             " F1 ",
             Style::default().fg(Color::Black).bg(Color::LightCyan),
         ),
-        Span::raw("帮助 · /context · /plan on|off"),
+        Span::raw("帮助 · Ctrl+↑↓ 事件 · /context · /plan on|off"),
     ]));
     frame.render_widget(footer, areas.footer);
 
-    if app.pending_confirmation.is_none() && !app.show_help && !app.show_context {
+    if app.pending_confirmation.is_none()
+        && app.session_picker.is_none()
+        && !app.show_help
+        && !app.show_context
+    {
         let visible_line = input_view.cursor_row.saturating_sub(input_scroll as usize);
         let x = areas.input.x.saturating_add(1).saturating_add(
             u16::try_from(input_view.cursor_col.min(app.input_width.saturating_sub(1)))
@@ -1261,6 +1454,8 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     if let Some(pending) = &app.pending_confirmation {
         overlay::draw_confirmation(frame, &pending.prompt);
+    } else if let Some(picker) = &app.session_picker {
+        overlay::draw_sessions(frame, &picker.current_id, &picker.sessions, picker.selected);
     } else if app.show_help {
         overlay::draw_help(frame);
     } else if app.show_context {
@@ -1320,45 +1515,19 @@ fn is_plan_message(messages: &[Message], index: usize) -> bool {
     })
 }
 
-fn format_session_list(current_id: &str, sessions: &[SessionSummary]) -> String {
-    if sessions.is_empty() {
-        return "当前 workspace 还没有保存的会话。".to_owned();
-    }
-    let mut output = String::from("会话列表：\n");
-    for session in sessions {
-        let marker = if session.id == current_id { "*" } else { " " };
-        let verification =
-            verification_label(session.workspace_revision, session.last_verified_revision);
-        output.push_str(&format!(
-            "{marker} {}  {}  rev {} {}  plan {}  {}\n",
-            session.id,
-            session.title,
-            session.workspace_revision,
-            verification,
-            if session.planning_enabled {
-                "on"
-            } else {
-                "off"
-            },
-            session.updated_at
-        ));
-    }
-    output.push_str("\n使用 /switch <id或唯一前缀> 切换。");
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use tokio::sync::mpsc;
 
-    use super::{App, WorkerCommand, WorkerEvent, draw, format_session_list};
+    use super::{App, WorkerCommand, WorkerEvent, draw, handle_key, handle_mouse};
     use crate::agent::{AgentEvent, AgentPhase};
     use crate::session::SessionSummary;
-    use crate::tui::model::MessageRole;
+    use crate::tui::model::{EventKind, MessageRole};
 
     #[test]
     fn session_commands_are_dispatched_with_the_requested_id() {
@@ -1402,23 +1571,70 @@ mod tests {
     }
 
     #[test]
-    fn session_list_marks_current_and_displays_revisions() {
-        let sessions = vec![SessionSummary {
-            id: "session-123".to_owned(),
-            title: "fix checkout".to_owned(),
-            workspace: PathBuf::from("workspace"),
-            updated_at: "2026-08-27T20:00:00+08:00".to_owned(),
-            workspace_revision: 2,
-            last_verified_revision: Some(2),
-            planning_enabled: true,
-        }];
+    fn session_picker_selects_with_arrows_and_switches_without_typing_an_id() {
+        let mut app = App::new(PathBuf::from("workspace"), "model".to_owned());
+        let sessions = vec![
+            SessionSummary {
+                id: "session-other".to_owned(),
+                title: "fix checkout".to_owned(),
+                workspace: PathBuf::from("workspace"),
+                updated_at: "2026-08-27T19:00:00+08:00".to_owned(),
+                workspace_revision: 2,
+                last_verified_revision: Some(2),
+                planning_enabled: true,
+            },
+            SessionSummary {
+                id: "session-current".to_owned(),
+                title: "current session".to_owned(),
+                workspace: PathBuf::from("workspace"),
+                updated_at: "2026-08-27T20:00:00+08:00".to_owned(),
+                workspace_revision: 0,
+                last_verified_revision: None,
+                planning_enabled: false,
+            },
+        ];
+        app.apply_worker_event(WorkerEvent::SessionList {
+            current_id: "session-current".to_owned(),
+            sessions,
+        });
 
-        let output = format_session_list("session-123", &sessions);
+        let picker = app.session_picker.as_ref().expect("picker");
+        assert_eq!(picker.selected, 1, "current session starts selected");
 
-        assert!(output.contains("* session-123"));
-        assert!(output.contains("fix checkout"));
-        assert!(output.contains("rev 2"));
-        assert!(output.contains("/switch"));
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw picker");
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(rendered.contains("fix checkout"));
+        assert!(rendered.contains("rev 2"));
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &sender,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &sender,
+        );
+        assert!(app.session_picker.is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WorkerCommand::SwitchSession(id)) if id == "session-other"
+        ));
     }
 
     #[test]
@@ -1512,6 +1728,67 @@ mod tests {
                 });
         assert!(rendered.contains("LATEST_USER_BODY"));
         assert!(app.chat_scroll > 0, "wrapped rows must require scrolling");
+    }
+
+    #[test]
+    fn events_support_keyboard_and_mouse_scrolling_then_resume_following() {
+        let mut app = App::new(PathBuf::from("workspace"), "model".to_owned());
+        app.events.clear();
+        for index in 0..40 {
+            app.push_event(
+                EventKind::Info,
+                format!("event {index}: wrapped event details"),
+            );
+        }
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("initial draw");
+
+        assert!(app.events_max_scroll > 0);
+        assert_eq!(app.events_scroll, app.events_max_scroll);
+        assert!(app.follow_events);
+
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL),
+            &sender,
+        );
+        assert!(!app.follow_events);
+        assert!(app.events_scroll < app.events_max_scroll);
+
+        let paused_scroll = app.events_scroll;
+        app.push_event(EventKind::Info, "new event while browsing history");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("paused draw");
+        assert_eq!(app.events_scroll, paused_scroll);
+
+        let event_column = app.events_area.x.saturating_add(1);
+        let event_row = app.events_area.y.saturating_add(1);
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: event_column,
+                row: event_row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(app.events_scroll < paused_scroll);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL),
+            &sender,
+        );
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("following draw");
+        assert!(app.follow_events);
+        assert_eq!(app.events_scroll, app.events_max_scroll);
     }
 
     #[test]

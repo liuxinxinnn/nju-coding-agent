@@ -1,9 +1,10 @@
 use std::io::{self, IsTerminal, Stdout};
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use crossterm::{ExecutableCommand, execute};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -21,7 +22,7 @@ impl TerminalGuard {
         }
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = stdout.execute(EnterAlternateScreen) {
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -35,7 +36,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }

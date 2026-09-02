@@ -39,6 +39,7 @@ TUI 快捷键：
 
 - `Enter` 发送，`Shift+Enter` 换行。
 - `Up/Down`、`PageUp/PageDown`、`Home/End` 滚动对话。
+- 鼠标滚轮滚动指针所在的 Conversation/Events；`Ctrl+Up/Down`、`Ctrl+PageUp/PageDown`、`Ctrl+Home/End` 独立滚动事件栏。
 - `Ctrl+P/N` 浏览输入历史，`Ctrl+L` 折叠事件栏。
 - `F1` 帮助，`Ctrl+D` 退出。
 - 内置命令：`/context`、`/memory`、`/plan [on|off]`、`/new`、`/sessions`、`/switch <id>`、`/delete <id>`、`/help`、`/clear`、`/status`、`/tools`、`/exit`。
@@ -96,7 +97,7 @@ Agent 优先读取 workspace 根目录中的确定性标志，并把结果注入
 TUI 启动时自动恢复当前 workspace 最近使用的会话。每个会话独立保存完整消息历史、workspace、`workspace_revision`、`last_verified_revision`、Plan 开关、真实 API 累计用量和估算校准状态，所以切换回来后可以继续原有上下文与运行状态：
 
 - `/new`：保存当前会话并新建空会话。
-- `/sessions`：列出当前 workspace 的会话；`*` 表示当前会话。
+- `/sessions`：打开会话选择弹窗；用 `Up/Down` 选择、`Enter` 切换、`N` 新建、`Esc` 关闭，`●` 表示当前会话。
 - `/switch <id>`：按完整 ID 或唯一前缀切换并恢复对话。
 - `/delete <id>`：删除会话；删除当前会话时会自动建立一个空会话。
 
